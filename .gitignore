@@ -1,0 +1,27 @@
+# Local config — contains personal values (domain, repo name, account ids, paths)
+# Each has a corresponding *.example.* template that IS committed.
+worker/wrangler.toml
+sync/pull.sh
+hooks/session-start.sh
+
+# Personal Claude Code context — instructions specific to this user's setup.
+CLAUDE.md
+
+# Secrets and state
+.env
+.dev.vars
+.wrangler/
+
+# BMAD-method installation artifacts (not part of the runtime)
+_bmad/
+_bmad-output/
+.claude/
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,30 @@
+name = "my-finance-worker"
+main = "src/index.js"
+compatibility_date = "2026-04-28"
+
+# Маршрут Worker'а. Замени на свой домен.
+# Path-prefix `/api/*` чтобы PWA и Worker могли жить на одном домене (PWA на Pages, Worker перехватывает только /api/*).
+# `workers_dev = false` отключает fallback на workers.dev — единственный путь через кастомный домен.
+workers_dev = false
+preview_urls = false
+[[routes]]
+pattern = "your-domain.example.com/api/*"
+zone_name = "example.com"
+
+# Public, non-secret config. Code reads these as env.REPO, env.BRANCH, env.DEFAULT_ACCOUNT_*.
+# - REPO   — приватный репозиторий GitHub, где Worker хранит balances.json и events.json
+# - BRANCH — ветка для коммитов
+# - DEFAULT_ACCOUNT_* — id счёта в balances.json, на который роутится quick-expense
+#   при распознавании валютного токена в тексте (usdt/rub/руб).
+[vars]
+REPO = "your-github-user/your-private-data-repo"
+BRANCH = "master"
+DEFAULT_ACCOUNT_USDT = "usdt-account-id"
+DEFAULT_ACCOUNT_RUB = "rub-account-id"
+DEFAULT_ACCOUNT_THB = "thb-account-id"
+
+# Real secrets are NOT in this file — set via wrangler CLI:
+#   npx wrangler@latest secret put GITHUB_TOKEN
+#     (fine-grained PAT, scope: your data repo, Contents: read+write)
+#   npx wrangler@latest secret put APP_TOKEN
+#     (long random string used by PWA as Bearer)
