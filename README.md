@@ -1,4 +1,4 @@
-# my-finans
+# quick-expenses
 
 Hot-capture personal expense tracker. PWA on the home screen → Cloudflare Worker → commit to a private GitHub repo → cron-pulled to a laptop. The point is to log one expense («coffee 350») in ≤5–10 seconds at the moment of purchase, and do reconciliation (FX, balances, big events) later in a Claude Code session over the data repo.
 
