@@ -355,9 +355,11 @@ async function createEvent(env, body) {
 
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const refSha = await getBranchHead(env);
-      const balances = await readJSONFile(env, 'balances.json', refSha);
-      const eventsFile = await readJSONFile(env, 'events.json', refSha);
+      const snap = await getBranchSnapshot(env);
+      const [balances, eventsFile] = await Promise.all([
+        readJSONFile(env, 'balances.json', snap.commitSha),
+        readJSONFile(env, 'events.json', snap.commitSha),
+      ]);
       if (!balances) return error(500, 'balances.json missing');
       const events = (eventsFile && eventsFile.events) || [];
 
@@ -365,7 +367,7 @@ async function createEvent(env, body) {
       newBalances.updated_at = event.at;
       const newEvents = { events: [...events, event] };
 
-      await commitMultiple(env, refSha, [
+      await commitMultiple(env, snap, [
         { path: 'balances.json', content: JSON.stringify(newBalances, null, 2) + '\n' },
         { path: 'events.json', content: JSON.stringify(newEvents, null, 2) + '\n' },
       ], `Event: ${describeEvent(event)}`);
@@ -382,9 +384,11 @@ async function createEvent(env, body) {
 async function handleEventDelete(env) {
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const refSha = await getBranchHead(env);
-      const balances = await readJSONFile(env, 'balances.json', refSha);
-      const eventsFile = await readJSONFile(env, 'events.json', refSha);
+      const snap = await getBranchSnapshot(env);
+      const [balances, eventsFile] = await Promise.all([
+        readJSONFile(env, 'balances.json', snap.commitSha),
+        readJSONFile(env, 'events.json', snap.commitSha),
+      ]);
 
       const events = (eventsFile && eventsFile.events) || [];
       if (events.length === 0) return error(404, 'no events to undo');
@@ -395,7 +399,7 @@ async function handleEventDelete(env) {
       newBalances.updated_at = new Date().toISOString();
       const newEvents = { events: events.slice(0, -1) };
 
-      await commitMultiple(env, refSha, [
+      await commitMultiple(env, snap, [
         { path: 'balances.json', content: JSON.stringify(newBalances, null, 2) + '\n' },
         { path: 'events.json', content: JSON.stringify(newEvents, null, 2) + '\n' },
       ], `Undo: ${describeEvent(last)}`);
@@ -420,11 +424,11 @@ function ghHeaders(env) {
   };
 }
 
-async function getBranchHead(env) {
-  const res = await fetch(`https://api.github.com/repos/${env.REPO}/git/refs/heads/${env.BRANCH}`, { headers: ghHeaders(env) });
-  if (!res.ok) throw new Error(`git refs ${res.status}`);
+async function getBranchSnapshot(env) {
+  const res = await fetch(`https://api.github.com/repos/${env.REPO}/branches/${env.BRANCH}`, { headers: ghHeaders(env) });
+  if (!res.ok) throw new Error(`branches ${res.status}`);
   const j = await res.json();
-  return j.object.sha;
+  return { commitSha: j.commit.sha, treeSha: j.commit.commit.tree.sha };
 }
 
 async function readJSONFile(env, path, ref) {
@@ -437,30 +441,16 @@ async function readJSONFile(env, path, ref) {
   catch { throw new Error(`${path} is not valid JSON`); }
 }
 
-async function commitMultiple(env, parentCommitSha, files, message) {
-  const headers = ghHeaders(env);
-  const jsonHeaders = { ...headers, 'Content-Type': 'application/json' };
-
-  const parentCommitRes = await fetch(`https://api.github.com/repos/${env.REPO}/git/commits/${parentCommitSha}`, { headers });
-  if (!parentCommitRes.ok) throw new Error(`git commit ${parentCommitRes.status}`);
-  const parentCommit = await parentCommitRes.json();
-
-  const blobs = [];
-  for (const f of files) {
-    const blobRes = await fetch(`https://api.github.com/repos/${env.REPO}/git/blobs`, {
-      method: 'POST',
-      headers: jsonHeaders,
-      body: JSON.stringify({ content: f.content, encoding: 'utf-8' }),
-    });
-    if (!blobRes.ok) throw new Error(`blob ${blobRes.status}`);
-    const b = await blobRes.json();
-    blobs.push({ path: f.path, mode: '100644', type: 'blob', sha: b.sha });
-  }
+async function commitMultiple(env, snap, files, message) {
+  const jsonHeaders = { ...ghHeaders(env), 'Content-Type': 'application/json' };
 
   const treeRes = await fetch(`https://api.github.com/repos/${env.REPO}/git/trees`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ base_tree: parentCommit.tree.sha, tree: blobs }),
+    body: JSON.stringify({
+      base_tree: snap.treeSha,
+      tree: files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', content: f.content })),
+    }),
   });
   if (!treeRes.ok) throw new Error(`tree ${treeRes.status}`);
   const newTree = await treeRes.json();
@@ -468,7 +458,7 @@ async function commitMultiple(env, parentCommitSha, files, message) {
   const commitRes = await fetch(`https://api.github.com/repos/${env.REPO}/git/commits`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ message, tree: newTree.sha, parents: [parentCommitSha] }),
+    body: JSON.stringify({ message, tree: newTree.sha, parents: [snap.commitSha] }),
   });
   if (!commitRes.ok) throw new Error(`commit ${commitRes.status}`);
   const newCommit = await commitRes.json();

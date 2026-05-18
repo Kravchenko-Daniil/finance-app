@@ -37,27 +37,22 @@ if (!localStorage.getItem(TOKEN_KEY)) {
   setStatus('Заполни токен в настройках', 'err');
 }
 
-$('f').addEventListener('submit', async (e) => {
+$('f').addEventListener('submit', (e) => {
   e.preventDefault();
   const text = $('text').value.trim();
   if (!text) return;
 
-  $('submit').disabled = true;
-  setStatus('Отправляю…');
-
-  const result = await tryPost(text);
-  if (result.ok) {
-    $('text').value = '';
-    setStatus(`✓ ${text}`, 'ok');
-  } else if (result.networkError) {
-    enqueue(text);
-    $('text').value = '';
-    setStatus(`📦 в очереди: ${text}`, 'queue');
-  } else {
-    setStatus(`✗ ${result.error || 'ошибка'}`, 'err');
+  if (!localStorage.getItem(TOKEN_KEY)) {
+    setStatus('нет токена', 'err');
+    openSettings();
+    return;
   }
-  $('submit').disabled = false;
+
+  $('text').value = '';
+  setStatus(`✓ ${text}`, 'ok');
+  enqueue(text);
   updateQueueInfo();
+  flush();
 });
 
 async function tryPost(text) {
@@ -96,7 +91,6 @@ async function flush() {
   try {
     let q = getQueue();
     if (q.length === 0) return;
-    let sentCount = 0;
     let droppedCount = 0;
     while (q.length > 0) {
       const item = q[0];
@@ -104,7 +98,6 @@ async function flush() {
       if (result.ok) {
         q.shift();
         setQueue(q);
-        sentCount++;
       } else if (result.status && result.status >= 400 && result.status < 500) {
         q.shift();
         setQueue(q);
@@ -112,9 +105,6 @@ async function flush() {
       } else {
         break;
       }
-    }
-    if (sentCount > 0) {
-      setStatus(`✓ из очереди отправлено: ${sentCount}`, 'ok');
     }
     if (droppedCount > 0) {
       setStatus(`⚠ выброшено из очереди (ошибки): ${droppedCount}`, 'err');
