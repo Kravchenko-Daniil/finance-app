@@ -11,6 +11,7 @@ CLAUDE.md
 .env
 .dev.vars
 .wrangler/
+worker/google-service-account.json
 
 # BMAD-method installation artifacts (not part of the runtime)
 _bmad/

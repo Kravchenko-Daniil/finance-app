@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-06-05 — Миграция стораджа на Google Sheets
+
+Единое онлайн-хранилище вместо приватного GitHub-репо. Теперь данные — Google-таблица с двумя листами (`Events` + `Balances`), которую можно смотреть и править напрямую с любого устройства.
+
+### Worker (`worker/src/index.js`) — полностью переписан storage-слой
+- GitHub Contents/Trees API → **Google Sheets API**. Аутентификация: JWT сервис-аккаунта (RS256 через WebCrypto) → OAuth access token, кэш токена в isolate (`getAccessToken`).
+- `GET /api/balances` — читает лист `Balances`. `GET /api/day` — фильтрует expense-события из листа `Events` (markdown больше не читается). `POST /api/expense|event` — append в `Events` + мутация колонки amount в `Balances`. `DELETE /api/event/last` — реверс баланса + `deleteDimension` последней строки `Events`.
+- Контракт ответов для PWA сохранён байт-в-байт (`{updated_at, accounts}`, `{event, balances}`, `{expenses, totals}`).
+- Нет кросс-табличной атомарности (у Sheets нет транзакции между листами) — append/mutate последовательны; для одного пользователя окно гонки ничтожно, дрейф восстановим из лога. Идемпотентность по `client_id` сохранена (поиск в последних 200 строках `Events`).
+
+### Конфиг
+- `wrangler.toml`: убраны `REPO`/`BRANCH`/`GITHUB_TOKEN`; добавлены `SPREADSHEET_ID` (var) и `GOOGLE_SA_JSON` (secret).
+- Ключ сервис-аккаунта — `worker/google-service-account.json` (gitignored).
+
+### Миграция
+- `scripts/migrate-to-sheets.mjs` — одноразовый импорт `balances.json` + `events.json` + markdown-архива в таблицу. Dependency-free Node, JWT через `node:crypto`, `DRY_RUN=1` для превью. Прогон: 77 событий из лога + 104 из markdown (8 дублей по дням отброшены) = 181 событие, 5 счетов.
+
+### Тесты
+- `worker/test-smoke.mjs` переписан: убраны markdown-тесты (`insertExpense`/`parseDay`), добавлены `bangkokDateOf` и round-trip `rowToEvent`↔`eventToRow`. 60/60 зелёные.
+
+### Retired
+- Приватный data-репо `my-finance`, WSL cron (`sync/pull.sh`) и SessionStart hook заморожены как бэкап — в рантайме Sheets-трекера не участвуют.
+
+---
+
 ## 2026-05-03 — UX-полировка PWA (SW v6)
 
 ### Поле токена в настройках — скрыто точками

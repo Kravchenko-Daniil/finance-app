@@ -1,6 +1,6 @@
 # Deploy & install
 
-Step-by-step guide to spin up this project on a fresh Cloudflare account and a new GitHub data repo.
+Step-by-step guide to spin up this project on a fresh Cloudflare account with a Google Sheets backend.
 
 **Time:** ~30–45 minutes.
 
@@ -19,15 +19,13 @@ Step-by-step guide to spin up this project on a fresh Cloudflare account and a n
    │                                                       │
    │ /api/*                                                │
    │   → Cloudflare Worker (worker/src/index.js)           │
-   │     └─ GitHub API → <your-user>/<your-data-repo>      │
+   │     └─ Google Sheets API → your spreadsheet           │
+   │          ├── Events   (append-only log)               │
+   │          └── Balances (per-account balances)          │
    └───────────────────────────────────────────────────────┘
-                                                │
-                                   [cron pull every ~5 min]
-                                                ▼
-                                    <local clone of data repo>
 ```
 
-PWA and Worker share a single domain (same-origin). The PWA fetches relative paths `/api/...` — no CORS, no «Worker URL» field in settings; only a Bearer token.
+PWA and Worker share a single domain (same-origin). The PWA fetches relative paths `/api/...` — no CORS, no «Worker URL» field in settings; only a Bearer token. The Worker authenticates to Google with a service-account JWT (RS256, signed via WebCrypto) exchanged for an OAuth access token, cached per-isolate.
 
 ---
 
@@ -35,18 +33,24 @@ PWA and Worker share a single domain (same-origin). The PWA fetches relative pat
 
 - A **Cloudflare account** (free tier is enough).
 - A domain you own, with DNS managed by Cloudflare. Free `*.workers.dev` won't work for the single-domain setup; you need a real domain to attach both Pages and the Workers Route to.
-- A **private GitHub repository** to store data. The Worker commits to it via GitHub API. The repo just needs a `balances.json` (initial accounts) and an empty `events.json`. Example seed in `docs/data-repo-seed.md`.
-- `npm` / `npx` available locally (for `wrangler`).
+- A **Google account** and a **Google Cloud project** (free).
+- `npm` / `npx` available locally (for `wrangler`), plus Node 18+ if you want to run the migration script.
 
 ---
 
-## Step 1. GitHub fine-grained PAT
+## Step 1. Google service account + spreadsheet
 
-1. <https://github.com/settings/tokens?type=beta> → **Generate new token**.
-2. **Name:** anything (`<project>-sync`). **Expiration:** 1 year.
-3. **Repository access:** *Only select repositories* → pick your private data repo.
-4. **Repository permissions:** **Contents: Read and write**, **Metadata: Read-only** (auto).
-5. Generate, **copy** the token (`github_pat_...`).
+1. **Google Cloud Console** → your project → **APIs & Services → Library** → enable **Google Sheets API**.
+2. **APIs & Services → Credentials → Create credentials → Service account.** Name it anything (`<project>-sheets`). No roles needed.
+3. Open the service account → **Keys → Add key → Create new key → JSON.** A `*.json` file downloads — this is your `GOOGLE_SA_JSON`. Keep it private (it's a credential).
+4. Note the service account's **email** (looks like `name@project-id.iam.gserviceaccount.com`) — it's the `client_email` field inside the JSON.
+5. Create a **Google spreadsheet** with two tabs named exactly **`Events`** and **`Balances`**.
+6. **Share** the spreadsheet with the service-account email as **Editor**. (Without this the API returns 403.)
+7. Grab the spreadsheet id from its URL: `docs.google.com/spreadsheets/d/`**`<THIS>`**`/edit`.
+
+> The Worker writes headers/rows on first use, but it's simplest to seed the tabs with the migration script (Step 3b) or by hand:
+> - `Balances` row 1: `id | name | amount | currency`; cell `E1` = `Обновлено` (label), `F1` = an ISO timestamp; then one row per account.
+> - `Events` row 1: `id | type | from | to | amount | amount_to | note | at | client_id`.
 
 ---
 
@@ -70,17 +74,31 @@ cp wrangler.example.toml wrangler.toml
 Edit `wrangler.toml`:
 - `[[routes]].pattern` → `<your-domain>/api/*`
 - `[[routes]].zone_name` → root zone (e.g. `example.com` for `app.example.com/api/*`)
-- `[vars].REPO` → `<your-github-user>/<your-private-data-repo>`
-- `[vars].DEFAULT_ACCOUNT_USDT` / `_RUB` / `_THB` → the `id` values from your `balances.json`
+- `[vars].SPREADSHEET_ID` → your spreadsheet id from Step 1
+- `[vars].DEFAULT_ACCOUNT_USDT` / `_RUB` / `_THB` → the `id` values of your accounts in the `Balances` tab
 
 Then:
 
 ```bash
 npx wrangler@latest login                       # auth Cloudflare
-npx wrangler@latest secret put GITHUB_TOKEN     # paste PAT from Step 1
+npx wrangler@latest secret put GOOGLE_SA_JSON   # paste the FULL service-account JSON from Step 1
 npx wrangler@latest secret put APP_TOKEN        # paste token from Step 2
 npx wrangler@latest deploy
 ```
+
+> Pasting `GOOGLE_SA_JSON`: it's a multi-line JSON. `wrangler secret put` reads stdin — paste the whole file content (or `cat key.json | npx wrangler@latest secret put GOOGLE_SA_JSON`).
+
+### Step 3b. (Optional) Migrate existing data
+
+If you're coming from the older JSON/markdown storage, import it into the spreadsheet:
+
+```bash
+# from the project root; SOURCE_DIR = local clone of the old data repo
+SOURCE_DIR=/path/to/old-data DRY_RUN=1 node scripts/migrate-to-sheets.mjs   # preview, writes nothing
+SOURCE_DIR=/path/to/old-data node scripts/migrate-to-sheets.mjs             # clears + rewrites both tabs
+```
+
+The script reads the service-account key from `worker/google-service-account.json` (override with `SA_KEY=`) and the spreadsheet id from `worker/wrangler.toml` (override with `SPREADSHEET_ID=`). It's re-runnable.
 
 ### Smoke-test the Worker
 
@@ -116,7 +134,7 @@ curl -X POST "https://$DOMAIN/api/event" \
 curl -X DELETE "https://$DOMAIN/api/event/last" -H "Authorization: Bearer $TOKEN"
 ```
 
-All `POST`s return `{ok:true, event:{...}, balances:{...}}`. The atomic commit updates `balances.json` + `events.json` in a single commit via GitHub Trees API (CAS on ref).
+All `POST`s return `{ok:true, event:{...}, balances:{...}}`. The event is appended to the `Events` tab and the matching account `amount` is updated on the `Balances` tab.
 
 ---
 
@@ -150,59 +168,24 @@ That's it — no "Worker URL" field, the PWA fetches `/api/...` on the same orig
 
 1. Type `test 50` → green `✓ test 50`.
 2. Type `test-usdt 5 usdt` → should route to your USDT account (not the THB default).
-3. Open `https://github.com/<your-user>/<your-data-repo>/commits/master` — new commits `Event: ...`.
+3. Open your spreadsheet → the `Events` tab has new rows, `Balances` amounts updated.
 
 ---
 
-## Step 6. (Optional) Cron sync on your laptop
+## Step 6. (Legacy) Local clone / cron sync
 
-If you want a local clone of the data repo that stays fresh automatically, follow `sync/INSTALL.md`.
-
-Minimum:
-
-```bash
-cp sync/pull.example.sh sync/pull.sh
-# Edit REPO_DIR to point at your local clone of the data repo
-chmod +x sync/pull.sh
-
-sudo service cron start
-crontab -e
-# Add a line:
-*/5 * * * * /absolute/path/to/sync/pull.sh
-
-gh auth setup-git   # for git auth to private repo
-```
-
-Manual test:
-
-```bash
-sync/pull.sh && cat /tmp/data-sync.log
-```
-
----
-
-## Step 7. (Optional) Claude Code SessionStart hook
-
-To `git pull` the data repo whenever you start a Claude Code session:
-
-```bash
-cp hooks/session-start.example.sh hooks/session-start.sh
-# Edit REPO_DIR
-chmod +x hooks/session-start.sh
-```
-
-Then wire it into `~/.claude/settings.json` as a `SessionStart` hook (see `hooks/HOOK-INSTALL.md`).
+The `sync/` and `hooks/` scripts date from when the store was a GitHub repo (cron `git pull` of the data repo, plus a Claude Code SessionStart hook). **With the Google Sheets backend they're unnecessary** — the spreadsheet is the live store and you read it directly. They're kept in the repo for reference only; skip this step for a Sheets deployment.
 
 ---
 
 ## End-to-end checklist
 
-- [ ] `curl` quick-expense with a plain number → commit on GitHub data repo
+- [ ] Spreadsheet shared with the service-account email as Editor
+- [ ] `curl` quick-expense with a plain number → new row in the `Events` tab
 - [ ] `curl` quick-expense with `usdt` token → routes to your USDT account, not THB default
 - [ ] PWA opens on `<your-domain>`, Settings has only a token field
-- [ ] Recording from PWA → commit on GitHub
-- [ ] (If using cron) local clone updates within ~5 min
-- [ ] (If using hook) new Claude session sees fresh data immediately
+- [ ] Recording from PWA → row appears in the spreadsheet
+- [ ] Undo (`DELETE /api/event/last`) → last row removed, balance reverted
 
 ---
 
@@ -214,11 +197,11 @@ Then wire it into `~/.claude/settings.json` as a `SessionStart` hook (see `hooks
 
 **Pages returns HTML on `/api/balances` instead of JSON.** The Workers Route isn't matching, or hit Pages first. Workers Routes have priority over Pages by design — verify the pattern is exactly `<your-domain>/api/*` (not `/api*` or `api.<your-domain>/*`), and the zone is correct.
 
-**Worker 500 with `github GET 401`.** PAT invalid/expired. Regenerate → `wrangler secret put GITHUB_TOKEN`.
+**Worker 502 `sheets: ... 403`.** The spreadsheet isn't shared with the service-account email, or the Sheets API isn't enabled on the project. Re-check Step 1.6 and 1.1.
 
-**Worker 500 with `ref conflict`.** SHA conflict after 4 retries — extremely rare, usually from parallel writes. Just retry.
+**Worker 502 `sheets: ... 400` / `Unable to parse range`.** Tab names don't match. They must be exactly `Events` and `Balances` (case-sensitive).
 
-**Local clone doesn't update.** `cat /tmp/data-sync.log` → cron running? `sudo service cron status` → up? `crontab -l` → line present? `cd <repo> && git pull` works manually?
+**Worker 502 `sheets: token exchange ...`.** `GOOGLE_SA_JSON` is malformed, truncated, or the key was revoked. Re-paste the full JSON: `wrangler secret put GOOGLE_SA_JSON`.
 
 **PWA didn't update after deploy.** Service Worker is caching. Close-reopen PWA, or DevTools → Application → Clear storage. Cache version is the `CACHE` constant in `pwa/sw.js` — bump it on significant changes.
 
@@ -230,19 +213,19 @@ Then wire it into `~/.claude/settings.json` as a `SessionStart` hook (see `hooks
 
 ## What's intentionally NOT in MVP
 
-- **Auto FX.** Reconciliation done elsewhere (in a Claude session over the data repo).
-- **Categories.** Free-text `note`; categorize later via Claude.
-- **In-PWA chat with Claude.** Requires a paid Anthropic API key — use Claude Code locally over the data repo instead.
-- **Multiple users.** Single Bearer token, single data repo. If you need multi-user, that's a different project.
+- **Auto FX.** Reconciliation done in the spreadsheet (or in a Claude session over exported data).
+- **Categories.** Free-text `note`; categorize later.
+- **In-PWA chat with Claude.** Requires a paid Anthropic API key — use Claude Code locally instead.
+- **Multiple users.** Single Bearer token, single spreadsheet. If you need multi-user, that's a different project.
 
 ---
 
 ## What's in `worker/test-smoke.mjs`
 
-Unit tests for pure logic (parser + bangkokContext + parseDay + applyMutation/reverseMutation + validateEvent + currency tokens). Run with `cd worker && node test-smoke.mjs`.
-
-The tests read a real archived markdown file via the `ARCHIVE_MD_PATH` env variable. If unset, the file-dependent tests are skipped. Set it when you want to run integration-style checks against your own archived data:
+Unit tests for pure logic (no fetch / no Sheets calls): `parseExpense`, `bangkokContext` / `bangkokDateOf`, the `rowToEvent`↔`eventToRow` round-trip, `validateEvent`, and `applyMutation` / `reverseMutation`. Run with:
 
 ```bash
-ARCHIVE_MD_PATH=/path/to/old-expenses.md node test-smoke.mjs
+cd worker && node test-smoke.mjs
 ```
+
+The functions are inline copies of the pure logic in `src/index.js` — keep them in sync when the source changes.

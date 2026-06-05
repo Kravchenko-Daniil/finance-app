@@ -1,10 +1,33 @@
-// REPO / BRANCH / DEFAULT_ACCOUNT_* приходят через env (см. wrangler.toml [vars]).
-// Никакие личные значения не хранятся в коде — это публичный шаблон.
+// Storage backend: Google Sheets (spreadsheet with two tabs: Events + Balances).
+// Auth: a Google service-account JWT (RS256, signed via WebCrypto) is exchanged
+// for an OAuth access token, which is cached in-isolate until it expires.
+//
+// Config comes through env (see wrangler.toml):
+//   SPREADSHEET_ID        — the target spreadsheet id
+//   GOOGLE_SA_JSON        — full service-account JSON (secret)
+//   APP_TOKEN             — bearer token the PWA sends (secret)
+//   DEFAULT_ACCOUNT_*     — account id quick-expense routes to per currency
+//
+// No personal values live in code — this is a public template.
+//
+// === Sheet schema ===
+// Events  (row 1 = headers): A:id  B:type  C:from  D:to  E:amount  F:amount_to  G:note  H:at  I:client_id
+// Balances(row 1 = headers): A:id  B:name  C:amount  D:currency  |  E1 label "Обновлено", F1 = updated_at ISO
+//
+// Both sheets are read/written with valueInputOption=RAW (no locale parsing) and
+// valueRenderOption=UNFORMATTED_VALUE (numbers come back as numbers, the ISO `at`
+// stays a plain string). The user may hand-edit either sheet — the Worker never
+// assumes it is the only writer beyond the per-request read→mutate→write window.
 
 const WEEKDAYS_RU = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 const MONTHS_EN = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+const EVENTS_SHEET = 'Events';
+const BALANCES_SHEET = 'Balances';
+// Column order the Worker reads/writes for the Events sheet.
+const EVENT_COLS = ['id', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'at', 'client_id'];
 
 export default {
   async fetch(req, env) {
@@ -15,11 +38,15 @@ export default {
 
     const url = new URL(req.url);
 
-    if (req.method === 'GET' && url.pathname === '/api/balances') return getBalances(env);
-    if (req.method === 'GET' && url.pathname === '/api/day') return getDay(req, env);
-    if (req.method === 'POST' && url.pathname === '/api/event') return handleEvent(req, env);
-    if (req.method === 'DELETE' && url.pathname === '/api/event/last') return handleEventDelete(env);
-    if (req.method === 'POST' && url.pathname === '/api/expense') return handleQuickExpense(req, env);
+    try {
+      if (req.method === 'GET' && url.pathname === '/api/balances') return await getBalances(env);
+      if (req.method === 'GET' && url.pathname === '/api/day') return await getDay(req, env);
+      if (req.method === 'POST' && url.pathname === '/api/event') return await handleEvent(req, env);
+      if (req.method === 'DELETE' && url.pathname === '/api/event/last') return await handleEventDelete(env);
+      if (req.method === 'POST' && url.pathname === '/api/expense') return await handleQuickExpense(req, env);
+    } catch (e) {
+      return error(502, `sheets: ${e.message}`);
+    }
 
     return error(404, 'not found');
   },
@@ -92,7 +119,6 @@ function bangkokContext(nowISO) {
   const monthEn = MONTHS_EN[month - 1];
   return {
     year, month, day, weekdayRu, monthEn,
-    filename: `archive/daily-expenses-${monthEn}-${year}.md`,
     sectionHeader: `## ${pad(day)}.${pad(month)}.${year}, ${weekdayRu}`,
   };
 }
@@ -106,54 +132,14 @@ function bangkokDateOf(iso) {
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
-// === MARKDOWN ARCHIVE PARSER ===
-// Read-only. Used by GET /day to display historical days from old markdown
-// (April + May 2026 before migration to events). Worker no longer writes markdown.
-
-const PIPE_PLACEHOLDER = '';
-
-function parseDay(content, sectionHeader) {
-  const lines = content.split('\n');
-  const headerIdx = lines.findIndex((l) => l.trim() === sectionHeader);
-  if (headerIdx === -1) return [];
-
-  const expenses = [];
-  for (let i = headerIdx + 1; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-    if (/^## \d{2}\.\d{2}\.\d{4}/.test(trimmed)) break;
-    if (trimmed === '---' && expenses.length > 0) break;
-    if (!trimmed.startsWith('|')) continue;
-    if (/^\|\s*Что\s*\|/i.test(trimmed)) continue;
-    if (/^\|---/.test(trimmed)) continue;
-    if (/^\|\s*\*\*Итого/.test(trimmed)) continue;
-
-    const safe = trimmed.replace(/\\\|/g, PIPE_PLACEHOLDER);
-    const m = safe.match(/^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$/);
-    if (!m) continue;
-    const desc = m[1].split(PIPE_PLACEHOLDER).join('|').trim();
-    const amountStr = m[2].replace(/\s+/g, '').replace(/\*+/g, '').trim();
-    const amount = parseInt(amountStr, 10);
-    if (!isFinite(amount) || amount <= 0) continue;
-    expenses.push({ description: desc, amount });
-  }
-  return expenses;
-}
-
-// === BALANCES ===
+// === BALANCES (read Balances sheet → {updated_at, accounts}) ===
 
 async function getBalances(env) {
-  const url = `https://api.github.com/repos/${env.REPO}/contents/balances.json?ref=${env.BRANCH}`;
-  const res = await fetch(url, { headers: ghHeaders(env) });
-  if (res.status === 404) return json({ updated_at: null, accounts: [] });
-  if (!res.ok) return error(502, `github GET ${res.status}`);
-  const data = await res.json();
-  let parsed;
-  try { parsed = JSON.parse(base64ToUtf8(data.content)); }
-  catch { return error(500, 'balances.json is not valid JSON'); }
-  return json(parsed);
+  const { accounts, updatedAt } = await readBalances(env);
+  return json({ updated_at: updatedAt, accounts });
 }
 
-// === DAY (aggregates archive markdown + expense events) ===
+// === DAY (filters expense events from the Events sheet for a given Bangkok day) ===
 
 async function getDay(req, env) {
   const url = new URL(req.url);
@@ -169,31 +155,12 @@ async function getDay(req, env) {
 
   const dateISO = `${ctx.year}-${pad(ctx.month)}-${pad(ctx.day)}`;
 
-  const [mdResult, eventsData, balancesData] = await Promise.all([
-    (async () => {
-      const ghUrl = `https://api.github.com/repos/${env.REPO}/contents/${encodeURIComponent(ctx.filename)}?ref=${env.BRANCH}`;
-      const r = await fetch(ghUrl, { headers: ghHeaders(env) });
-      if (r.status === 404) return { ok: true, content: null };
-      if (!r.ok) return { ok: false, status: r.status };
-      const j = await r.json();
-      return { ok: true, content: base64ToUtf8(j.content) };
-    })(),
-    readJSONFile(env, 'events.json', env.BRANCH).catch(() => null),
-    readJSONFile(env, 'balances.json', env.BRANCH).catch(() => null),
-  ]);
-
-  if (!mdResult.ok) return error(502, `github GET ${mdResult.status}`);
-
-  const mdExpenses = mdResult.content
-    ? parseDay(mdResult.content, ctx.sectionHeader).map((e) => ({ ...e, currency: 'THB', source: 'md' }))
-    : [];
+  const [events, { accounts }] = await Promise.all([readEvents(env), readBalances(env)]);
 
   const accountCurrency = {};
-  if (balancesData && Array.isArray(balancesData.accounts)) {
-    for (const a of balancesData.accounts) accountCurrency[a.id] = a.currency;
-  }
+  for (const a of accounts) accountCurrency[a.id] = a.currency;
 
-  const eventExpenses = (eventsData && Array.isArray(eventsData.events) ? eventsData.events : [])
+  const expenses = events
     .filter((ev) => ev.type === 'expense' && ev.at && bangkokDateOf(ev.at) === dateISO)
     .map((ev) => ({
       description: ev.note || (ev.from ? `с ${ev.from}` : 'расход'),
@@ -204,14 +171,13 @@ async function getDay(req, env) {
       id: ev.id,
     }));
 
-  const all = [...mdExpenses, ...eventExpenses];
   const totals = {};
-  for (const e of all) totals[e.currency] = (totals[e.currency] || 0) + e.amount;
+  for (const e of expenses) totals[e.currency] = (totals[e.currency] || 0) + e.amount;
 
-  return json({ date: dateISO, section: ctx.sectionHeader, expenses: all, totals });
+  return json({ date: dateISO, section: ctx.sectionHeader, expenses, totals });
 }
 
-// === QUICK EXPENSE (POST /) — main screen of PWA ===
+// === QUICK EXPENSE (POST /api/expense) — main screen of PWA ===
 
 async function handleQuickExpense(req, env) {
   let body;
@@ -275,52 +241,52 @@ function validateEvent(body) {
   return { ok: true };
 }
 
-function findAccount(balances, id) {
-  const acc = (balances.accounts || []).find((a) => a.id === id);
+function findAccount(accounts, id) {
+  const acc = accounts.find((a) => a.id === id);
   if (!acc) throw new Error(`unknown account: ${id}`);
   return acc;
 }
 
-function roundCents(balances) {
-  for (const a of balances.accounts || []) a.amount = Math.round(a.amount * 100) / 100;
-  return balances;
+function roundCents(accounts) {
+  for (const a of accounts) a.amount = Math.round(a.amount * 100) / 100;
+  return accounts;
 }
 
-function applyMutation(balances, event) {
+function applyMutation(accounts, event) {
   if (event.type === 'income') {
-    findAccount(balances, event.to).amount += event.amount;
+    findAccount(accounts, event.to).amount += event.amount;
   } else if (event.type === 'expense') {
-    findAccount(balances, event.from).amount -= event.amount;
+    findAccount(accounts, event.from).amount -= event.amount;
   } else if (event.type === 'transfer') {
-    const from = findAccount(balances, event.from);
-    const to = findAccount(balances, event.to);
+    const from = findAccount(accounts, event.from);
+    const to = findAccount(accounts, event.to);
     if (from.currency !== to.currency) throw new Error('transfer requires same currency');
     from.amount -= event.amount;
     to.amount += event.amount;
   } else if (event.type === 'exchange') {
-    findAccount(balances, event.from).amount -= event.amount;
-    findAccount(balances, event.to).amount += event.amount_to;
+    findAccount(accounts, event.from).amount -= event.amount;
+    findAccount(accounts, event.to).amount += event.amount_to;
   } else {
     throw new Error(`unknown event type: ${event.type}`);
   }
-  return roundCents(balances);
+  return roundCents(accounts);
 }
 
-function reverseMutation(balances, event) {
+function reverseMutation(accounts, event) {
   if (event.type === 'income') {
-    findAccount(balances, event.to).amount -= event.amount;
+    findAccount(accounts, event.to).amount -= event.amount;
   } else if (event.type === 'expense') {
-    findAccount(balances, event.from).amount += event.amount;
+    findAccount(accounts, event.from).amount += event.amount;
   } else if (event.type === 'transfer') {
-    findAccount(balances, event.from).amount += event.amount;
-    findAccount(balances, event.to).amount -= event.amount;
+    findAccount(accounts, event.from).amount += event.amount;
+    findAccount(accounts, event.to).amount -= event.amount;
   } else if (event.type === 'exchange') {
-    findAccount(balances, event.from).amount += event.amount;
-    findAccount(balances, event.to).amount -= event.amount_to;
+    findAccount(accounts, event.from).amount += event.amount;
+    findAccount(accounts, event.to).amount -= event.amount_to;
   } else {
     throw new Error(`unknown event type: ${event.type}`);
   }
-  return roundCents(balances);
+  return roundCents(accounts);
 }
 
 function describeEvent(ev) {
@@ -330,8 +296,6 @@ function describeEvent(ev) {
   if (ev.type === 'exchange') return `${ev.from} ${ev.amount} → ${ev.to} ${ev.amount_to}${ev.note ? ` (${ev.note})` : ''}`;
   return ev.type;
 }
-
-function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
 
 function genId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return `ev_${crypto.randomUUID().slice(0, 12)}`;
@@ -359,149 +323,285 @@ async function createEvent(env, body) {
     amount_to: body.amount_to != null ? Math.round(body.amount_to * 100) / 100 : null,
     note: body.note || null,
     at: body.at ? new Date(body.at).toISOString() : new Date().toISOString(),
+    client_id: clientId,
   };
-  if (clientId) event.client_id = clientId;
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      const snap = await getBranchSnapshot(env);
-      const [balances, eventsFile] = await Promise.all([
-        readJSONFile(env, 'balances.json', snap.commitSha),
-        readJSONFile(env, 'events.json', snap.commitSha),
-      ]);
-      if (!balances) return error(500, 'balances.json missing');
-      const events = (eventsFile && eventsFile.events) || [];
+  const token = await getAccessToken(env);
 
-      // Idempotency: if a recent event has the same client_id, the previous POST
-      // already committed — return it without a second write. Window of 200 covers
-      // any plausible PWA-queue flush burst.
-      if (clientId) {
-        const existing = events.slice(-200).find((e) => e.client_id === clientId);
-        if (existing) return ok({ event: existing, balances, deduped: true });
-      }
+  // Read current balances + the event log (the latter only when we need to
+  // de-duplicate a retried write). One round-trip each, in parallel.
+  const [{ accounts, updatedAt }, events] = await Promise.all([
+    readBalances(env, token),
+    clientId ? readEvents(env, token) : Promise.resolve(null),
+  ]);
 
-      const newBalances = applyMutation(deepClone(balances), event);
-      newBalances.updated_at = event.at;
-      const newEvents = { events: [...events, event] };
-
-      await commitMultiple(env, snap, [
-        { path: 'balances.json', content: JSON.stringify(newBalances, null, 2) + '\n' },
-        { path: 'events.json', content: JSON.stringify(newEvents, null, 2) + '\n' },
-      ], `Event: ${describeEvent(event)}`);
-
-      return ok({ event, balances: newBalances });
-    } catch (e) {
-      if (e.message === 'ref conflict' && attempt < 3) continue;
-      return error(500, e.message);
+  // Idempotency: if a recent event carries the same client_id, the previous POST
+  // already committed — return it without a second write. Window of 200 covers
+  // any plausible PWA-queue flush burst.
+  if (clientId && events) {
+    const existing = events.slice(-200).find((e) => e.client_id === clientId);
+    if (existing) {
+      const { client_id, ...publicExisting } = existing;
+      return ok({ event: publicExisting, balances: { updated_at: updatedAt, accounts }, deduped: true });
     }
   }
-  return error(500, 'too many conflicts');
+
+  const newAccounts = applyMutation(accounts.map((a) => ({ ...a })), event);
+  const newUpdatedAt = event.at;
+
+  // Append the event row first (the log is the source of truth — balances can
+  // always be recomputed from it), then write the new balances. Two requests:
+  // Sheets has no cross-tab transaction, but for a single user the window is
+  // negligible and a crash between them leaves only a recoverable drift.
+  await appendEvent(env, event, token);
+  await writeBalanceAmounts(env, newAccounts, newUpdatedAt, token);
+
+  // Don't echo client_id back to the client (internal idempotency key).
+  const { client_id, ...publicEvent } = event;
+  return ok({ event: publicEvent, balances: { updated_at: newUpdatedAt, accounts: newAccounts } });
 }
 
 async function handleEventDelete(env) {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      const snap = await getBranchSnapshot(env);
-      const [balances, eventsFile] = await Promise.all([
-        readJSONFile(env, 'balances.json', snap.commitSha),
-        readJSONFile(env, 'events.json', snap.commitSha),
-      ]);
+  const token = await getAccessToken(env);
 
-      const events = (eventsFile && eventsFile.events) || [];
-      if (events.length === 0) return error(404, 'no events to undo');
-      if (!balances) return error(500, 'balances.json missing');
+  const [events, { accounts }] = await Promise.all([
+    readEvents(env, token),
+    readBalances(env, token),
+  ]);
 
-      const last = events[events.length - 1];
-      const newBalances = reverseMutation(deepClone(balances), last);
-      newBalances.updated_at = new Date().toISOString();
-      const newEvents = { events: events.slice(0, -1) };
+  if (events.length === 0) return error(404, 'no events to undo');
 
-      await commitMultiple(env, snap, [
-        { path: 'balances.json', content: JSON.stringify(newBalances, null, 2) + '\n' },
-        { path: 'events.json', content: JSON.stringify(newEvents, null, 2) + '\n' },
-      ], `Undo: ${describeEvent(last)}`);
+  const last = events[events.length - 1];
+  const newAccounts = reverseMutation(accounts.map((a) => ({ ...a })), last);
+  const updatedAt = new Date().toISOString();
 
-      return ok({ undone: last, balances: newBalances });
-    } catch (e) {
-      if (e.message === 'ref conflict' && attempt < 3) continue;
-      return error(500, e.message);
-    }
-  }
-  return error(500, 'too many conflicts');
+  // Reverse the balance first, then drop the row. If the row delete failed the
+  // log would keep a phantom entry — reversing first means balances are right
+  // and a re-issued undo simply pops the same row.
+  await writeBalanceAmounts(env, newAccounts, updatedAt, token);
+  await deleteLastEventRow(env, events.length, token);
+
+  const { client_id, ...publicEvent } = last;
+  return ok({ undone: publicEvent, balances: { updated_at: updatedAt, accounts: newAccounts } });
 }
 
-// === GITHUB HELPERS ===
+// === GOOGLE AUTH (service-account JWT → OAuth access token) ===
 
-function ghHeaders(env) {
+// Cached per-isolate. Workers reuse isolates across requests, so most requests
+// skip the token exchange entirely.
+let cachedToken = null; // { value, exp } (exp in epoch ms)
+
+function getServiceAccount(env) {
+  if (!env.GOOGLE_SA_JSON) throw new Error('GOOGLE_SA_JSON not configured');
+  let sa;
+  try { sa = JSON.parse(env.GOOGLE_SA_JSON); }
+  catch { throw new Error('GOOGLE_SA_JSON is not valid JSON'); }
+  if (!sa.client_email || !sa.private_key) throw new Error('GOOGLE_SA_JSON missing client_email/private_key');
+  return sa;
+}
+
+async function getAccessToken(env) {
+  const now = Date.now();
+  if (cachedToken && cachedToken.exp > now + 60_000) return cachedToken.value;
+
+  const sa = getServiceAccount(env);
+  const iat = Math.floor(now / 1000);
+  const exp = iat + 3600;
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claim = {
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/spreadsheets',
+    aud: sa.token_uri || 'https://oauth2.googleapis.com/token',
+    iat,
+    exp,
+  };
+
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claim))}`;
+  const key = await importPrivateKey(sa.private_key);
+  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(signingInput));
+  const jwt = `${signingInput}.${base64urlBytes(new Uint8Array(sig))}`;
+
+  const res = await fetch(claim.aud, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}&assertion=${encodeURIComponent(jwt)}`,
+  });
+  if (!res.ok) throw new Error(`token exchange ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  cachedToken = { value: data.access_token, exp: now + (data.expires_in || 3600) * 1000 };
+  return cachedToken.value;
+}
+
+async function importPrivateKey(pem) {
+  const body = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/, '')
+    .replace(/-----END PRIVATE KEY-----/, '')
+    .replace(/\s+/g, '');
+  const der = base64ToBytes(body);
+  return crypto.subtle.importKey(
+    'pkcs8',
+    der,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+}
+
+// === GOOGLE SHEETS API ===
+
+function sheetsHeaders(token) {
+  return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+}
+
+async function sheetsValuesGet(env, range, token) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}/values/${encodeURIComponent(range)}?valueRenderOption=UNFORMATTED_VALUE`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`values.get ${range} ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return data.values || [];
+}
+
+async function readBalances(env, token) {
+  token = token || await getAccessToken(env);
+  // A1:F covers id/name/amount/currency plus the updated_at cell at F1.
+  const rows = await sheetsValuesGet(env, `${BALANCES_SHEET}!A1:F`, token);
+  const updatedAt = (rows[0] && rows[0][5] != null && rows[0][5] !== '') ? String(rows[0][5]) : null;
+  const accounts = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const id = r[0];
+    if (id == null || id === '') continue;
+    accounts.push({
+      id: String(id),
+      name: r[1] != null ? String(r[1]) : '',
+      amount: typeof r[2] === 'number' ? r[2] : parseFloat(r[2]) || 0,
+      currency: r[3] != null ? String(r[3]) : '',
+    });
+  }
+  return { accounts, updatedAt };
+}
+
+async function readEvents(env, token) {
+  token = token || await getAccessToken(env);
+  const rows = await sheetsValuesGet(env, `${EVENTS_SHEET}!A2:I`, token);
+  const events = [];
+  for (const r of rows) {
+    if (r[0] == null || r[0] === '') continue;
+    events.push(rowToEvent(r));
+  }
+  return events;
+}
+
+function rowToEvent(r) {
+  const cell = (i) => (r[i] === undefined || r[i] === '' ? null : r[i]);
+  const num = (i) => {
+    const v = cell(i);
+    if (v == null) return null;
+    return typeof v === 'number' ? v : parseFloat(v);
+  };
   return {
-    Authorization: `token ${env.GITHUB_TOKEN}`,
-    Accept: 'application/vnd.github+json',
-    'User-Agent': 'my-finance-worker',
-    'X-GitHub-Api-Version': '2022-11-28',
+    id: cell(0) != null ? String(cell(0)) : null,
+    type: cell(1) != null ? String(cell(1)) : null,
+    from: cell(2) != null ? String(cell(2)) : null,
+    to: cell(3) != null ? String(cell(3)) : null,
+    amount: num(4),
+    amount_to: num(5),
+    note: cell(6) != null ? String(cell(6)) : null,
+    at: cell(7) != null ? String(cell(7)) : null,
+    client_id: cell(8) != null ? String(cell(8)) : null,
   };
 }
 
-async function getBranchSnapshot(env) {
-  const res = await fetch(`https://api.github.com/repos/${env.REPO}/branches/${env.BRANCH}`, { headers: ghHeaders(env) });
-  if (!res.ok) throw new Error(`branches ${res.status}`);
-  const j = await res.json();
-  return { commitSha: j.commit.sha, treeSha: j.commit.commit.tree.sha };
+function eventToRow(ev) {
+  return EVENT_COLS.map((c) => {
+    const v = ev[c];
+    return v == null ? '' : v;
+  });
 }
 
-async function readJSONFile(env, path, ref) {
-  const url = `https://api.github.com/repos/${env.REPO}/contents/${encodeURIComponent(path)}?ref=${ref}`;
-  const res = await fetch(url, { headers: ghHeaders(env) });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`github GET ${path}: ${res.status}`);
-  const j = await res.json();
-  try { return JSON.parse(base64ToUtf8(j.content)); }
-  catch { throw new Error(`${path} is not valid JSON`); }
-}
-
-async function commitMultiple(env, snap, files, message) {
-  const jsonHeaders = { ...ghHeaders(env), 'Content-Type': 'application/json' };
-
-  const treeRes = await fetch(`https://api.github.com/repos/${env.REPO}/git/trees`, {
+async function appendEvent(env, event, token) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}/values/${encodeURIComponent(EVENTS_SHEET + '!A1')}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+  const res = await fetch(url, {
     method: 'POST',
-    headers: jsonHeaders,
+    headers: sheetsHeaders(token),
+    body: JSON.stringify({ values: [eventToRow(event)] }),
+  });
+  if (!res.ok) throw new Error(`values.append ${res.status}: ${await res.text()}`);
+}
+
+// Writes the amount column (C2:C{n+1}) and the updated_at cell (F1) in one
+// atomic values.batchUpdate. Amounts are written by row position, matching the
+// order they were just read in.
+async function writeBalanceAmounts(env, accounts, updatedAt, token) {
+  const lastRow = accounts.length + 1;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}/values:batchUpdate`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: sheetsHeaders(token),
     body: JSON.stringify({
-      base_tree: snap.treeSha,
-      tree: files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', content: f.content })),
+      valueInputOption: 'RAW',
+      data: [
+        { range: `${BALANCES_SHEET}!C2:C${lastRow}`, values: accounts.map((a) => [a.amount]) },
+        { range: `${BALANCES_SHEET}!F1`, values: [[updatedAt]] },
+      ],
     }),
   });
-  if (!treeRes.ok) throw new Error(`tree ${treeRes.status}`);
-  const newTree = await treeRes.json();
+  if (!res.ok) throw new Error(`values.batchUpdate ${res.status}: ${await res.text()}`);
+}
 
-  const commitRes = await fetch(`https://api.github.com/repos/${env.REPO}/git/commits`, {
+// sheetId (gid) per tab title, needed for structural row deletion. Cached per-isolate.
+let cachedSheetIds = null;
+
+async function getSheetId(env, title, token) {
+  if (!cachedSheetIds) {
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}?fields=sheets.properties(sheetId,title)`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`spreadsheets.get ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    cachedSheetIds = {};
+    for (const s of data.sheets || []) cachedSheetIds[s.properties.title] = s.properties.sheetId;
+  }
+  const id = cachedSheetIds[title];
+  if (id == null) throw new Error(`sheet not found: ${title}`);
+  return id;
+}
+
+// Deletes the last data row of the Events sheet. eventCount = number of data
+// rows (header excluded); the row to drop is at zero-based index eventCount
+// (header is index 0).
+async function deleteLastEventRow(env, eventCount, token) {
+  const sheetId = await getSheetId(env, EVENTS_SHEET, token);
+  const startIndex = eventCount; // header at 0, data rows at 1..eventCount
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}:batchUpdate`;
+  const res = await fetch(url, {
     method: 'POST',
-    headers: jsonHeaders,
-    body: JSON.stringify({ message, tree: newTree.sha, parents: [snap.commitSha] }),
+    headers: sheetsHeaders(token),
+    body: JSON.stringify({
+      requests: [{
+        deleteDimension: {
+          range: { sheetId, dimension: 'ROWS', startIndex, endIndex: startIndex + 1 },
+        },
+      }],
+    }),
   });
-  if (!commitRes.ok) throw new Error(`commit ${commitRes.status}`);
-  const newCommit = await commitRes.json();
-
-  const refRes = await fetch(`https://api.github.com/repos/${env.REPO}/git/refs/heads/${env.BRANCH}`, {
-    method: 'PATCH',
-    headers: jsonHeaders,
-    body: JSON.stringify({ sha: newCommit.sha, force: false }),
-  });
-  if (refRes.status === 422) throw new Error('ref conflict');
-  if (!refRes.ok) throw new Error(`update ref ${refRes.status}`);
-
-  return newCommit.sha;
+  if (!res.ok) throw new Error(`batchUpdate(delete) ${res.status}: ${await res.text()}`);
 }
 
-function utf8ToBase64(text) {
-  const bytes = new TextEncoder().encode(text);
-  let bin = '';
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin);
-}
+// === BASE64 HELPERS ===
 
-function base64ToUtf8(b64) {
-  const clean = b64.replace(/\s/g, '');
-  const bin = atob(clean);
+function base64ToBytes(b64) {
+  const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new TextDecoder().decode(bytes);
+  return bytes;
+}
+
+function base64urlBytes(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64url(text) {
+  return base64urlBytes(new TextEncoder().encode(text));
 }
