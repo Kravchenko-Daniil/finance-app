@@ -11,8 +11,12 @@
 // No personal values live in code — this is a public template.
 //
 // === Sheet schema ===
-// Events  (row 1 = headers): A:id  B:type  C:from  D:to  E:amount  F:amount_to  G:note  H:at  I:client_id
-// Balances(row 1 = headers): A:id  B:name  C:amount  D:currency  |  E1 label "Обновлено", F1 = updated_at ISO
+// Events  (row 1 = headers): A:when  B:type  C:from  D:to  E:amount  F:amount_to  G:note  H:id  I:at  J:client_id
+//   `when` is a display-only column (a short Bangkok date, derived from `at`); it
+//   is written on append and ignored on read. `at` (ISO) stays the source of truth.
+// Balances: F1 = updated_at ISO (raw, hidden). An "Updated" line sits up top; the
+//   accounts table is found by scanning column A for the "id" header and read
+//   until the first blank row (a totals block sits below that blank, ignored).
 //
 // Both sheets are read/written with valueInputOption=RAW (no locale parsing) and
 // valueRenderOption=UNFORMATTED_VALUE (numbers come back as numbers, the ISO `at`
@@ -26,8 +30,10 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 const EVENTS_SHEET = 'Events';
 const BALANCES_SHEET = 'Balances';
-// Column order the Worker reads/writes for the Events sheet.
-const EVENT_COLS = ['id', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'at', 'client_id'];
+// Column order the Worker reads/writes for the Events sheet. `when` is a
+// display-only derived column (see formatWhen); every other key maps 1:1 to the
+// event object.
+const EVENT_COLS = ['when', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'id', 'at', 'client_id'];
 
 export default {
   async fetch(req, env) {
@@ -130,6 +136,24 @@ function bangkokDateOf(iso) {
   });
   const parts = Object.fromEntries(fmt.formatToParts(new Date(iso)).map((p) => [p.type, p.value]));
   return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+// Display string for the Events `when` column: a short Bangkok date. Noon-exact
+// (12:00:00) is the backdate placeholder — no real time-of-day — so it shows the
+// date only; any other time shows `DD.MM.YYYY HH:MM`. Derived from `at` on write.
+function formatWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const fmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Bangkok',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  const p = Object.fromEntries(fmt.formatToParts(d).map((x) => [x.type, x.value]));
+  const date = `${p.day}.${p.month}.${p.year}`;
+  if (p.hour === '12' && p.minute === '00' && p.second === '00') return date;
+  return `${date} ${p.hour}:${p.minute}`;
 }
 
 // === BALANCES (read Balances sheet → {updated_at, accounts}) ===
@@ -330,7 +354,7 @@ async function createEvent(env, body) {
 
   // Read current balances + the event log (the latter only when we need to
   // de-duplicate a retried write). One round-trip each, in parallel.
-  const [{ accounts, updatedAt }, events] = await Promise.all([
+  const [{ accounts, updatedAt, dataStartRow }, events] = await Promise.all([
     readBalances(env, token),
     clientId ? readEvents(env, token) : Promise.resolve(null),
   ]);
@@ -354,7 +378,7 @@ async function createEvent(env, body) {
   // Sheets has no cross-tab transaction, but for a single user the window is
   // negligible and a crash between them leaves only a recoverable drift.
   await appendEvent(env, event, token);
-  await writeBalanceAmounts(env, newAccounts, newUpdatedAt, token);
+  await writeBalanceAmounts(env, newAccounts, newUpdatedAt, token, dataStartRow);
 
   // Don't echo client_id back to the client (internal idempotency key).
   const { client_id, ...publicEvent } = event;
@@ -364,7 +388,7 @@ async function createEvent(env, body) {
 async function handleEventDelete(env) {
   const token = await getAccessToken(env);
 
-  const [events, { accounts }] = await Promise.all([
+  const [events, { accounts, dataStartRow }] = await Promise.all([
     readEvents(env, token),
     readBalances(env, token),
   ]);
@@ -378,7 +402,7 @@ async function handleEventDelete(env) {
   // Reverse the balance first, then drop the row. If the row delete failed the
   // log would keep a phantom entry — reversing first means balances are right
   // and a re-issued undo simply pops the same row.
-  await writeBalanceAmounts(env, newAccounts, updatedAt, token);
+  await writeBalanceAmounts(env, newAccounts, updatedAt, token, dataStartRow);
   await deleteLastEventRow(env, events.length, token);
 
   const { client_id, ...publicEvent } = last;
@@ -463,14 +487,23 @@ async function sheetsValuesGet(env, range, token) {
 
 async function readBalances(env, token) {
   token = token || await getAccessToken(env);
-  // A1:F covers id/name/amount/currency plus the updated_at cell at F1.
+  // A1:F covers the accounts (id/name/amount/currency) plus the raw updated_at at
+  // F1. The accounts table no longer starts at row 1: find its header by scanning
+  // column A for "id", then read rows until the first blank (a totals block lives
+  // below that blank and must not be read as accounts). dataStartRow (1-based) is
+  // returned so the writer targets the right amount cells.
   const rows = await sheetsValuesGet(env, `${BALANCES_SHEET}!A1:F`, token);
   const updatedAt = (rows[0] && rows[0][5] != null && rows[0][5] !== '') ? String(rows[0][5]) : null;
+  let headerIdx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i] && String(rows[i][0]).toLowerCase() === 'id') { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) throw new Error('Balances: accounts header (id) not found');
   const accounts = [];
-  for (let i = 1; i < rows.length; i++) {
+  for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
-    const id = r[0];
-    if (id == null || id === '') continue;
+    const id = r && r[0];
+    if (id == null || id === '') break;
     accounts.push({
       id: String(id),
       name: r[1] != null ? String(r[1]) : '',
@@ -478,16 +511,17 @@ async function readBalances(env, token) {
       currency: r[3] != null ? String(r[3]) : '',
     });
   }
-  return { accounts, updatedAt };
+  return { accounts, updatedAt, dataStartRow: headerIdx + 2 };
 }
 
 async function readEvents(env, token) {
   token = token || await getAccessToken(env);
-  const rows = await sheetsValuesGet(env, `${EVENTS_SHEET}!A2:I`, token);
+  const rows = await sheetsValuesGet(env, `${EVENTS_SHEET}!A2:J`, token);
   const events = [];
   for (const r of rows) {
-    if (r[0] == null || r[0] === '') continue;
-    events.push(rowToEvent(r));
+    const ev = rowToEvent(r);
+    if (ev.id == null) continue; // blank/incomplete row
+    events.push(ev);
   }
   return events;
 }
@@ -499,21 +533,23 @@ function rowToEvent(r) {
     if (v == null) return null;
     return typeof v === 'number' ? v : parseFloat(v);
   };
+  // Column 0 is the display-only `when` string (derived from `at`) — ignored here.
   return {
-    id: cell(0) != null ? String(cell(0)) : null,
     type: cell(1) != null ? String(cell(1)) : null,
     from: cell(2) != null ? String(cell(2)) : null,
     to: cell(3) != null ? String(cell(3)) : null,
     amount: num(4),
     amount_to: num(5),
     note: cell(6) != null ? String(cell(6)) : null,
-    at: cell(7) != null ? String(cell(7)) : null,
-    client_id: cell(8) != null ? String(cell(8)) : null,
+    id: cell(7) != null ? String(cell(7)) : null,
+    at: cell(8) != null ? String(cell(8)) : null,
+    client_id: cell(9) != null ? String(cell(9)) : null,
   };
 }
 
 function eventToRow(ev) {
   return EVENT_COLS.map((c) => {
+    if (c === 'when') return formatWhen(ev.at); // display-only, derived from `at`
     const v = ev[c];
     return v == null ? '' : v;
   });
@@ -532,8 +568,9 @@ async function appendEvent(env, event, token) {
 // Writes the amount column (C2:C{n+1}) and the updated_at cell (F1) in one
 // atomic values.batchUpdate. Amounts are written by row position, matching the
 // order they were just read in.
-async function writeBalanceAmounts(env, accounts, updatedAt, token) {
-  const lastRow = accounts.length + 1;
+async function writeBalanceAmounts(env, accounts, updatedAt, token, dataStartRow) {
+  const start = dataStartRow || 2;
+  const lastRow = start + accounts.length - 1;
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}/values:batchUpdate`;
   const res = await fetch(url, {
     method: 'POST',
@@ -541,7 +578,7 @@ async function writeBalanceAmounts(env, accounts, updatedAt, token) {
     body: JSON.stringify({
       valueInputOption: 'RAW',
       data: [
-        { range: `${BALANCES_SHEET}!C2:C${lastRow}`, values: accounts.map((a) => [a.amount]) },
+        { range: `${BALANCES_SHEET}!C${start}:C${lastRow}`, values: accounts.map((a) => [a.amount]) },
         { range: `${BALANCES_SHEET}!F1`, values: [[updatedAt]] },
       ],
     }),

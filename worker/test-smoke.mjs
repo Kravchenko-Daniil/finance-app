@@ -55,26 +55,47 @@ function bangkokDateOf(iso) {
 
 // === Sheets row <-> event mapping (pure) ===
 
-const EVENT_COLS = ['id', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'at', 'client_id'];
+const EVENT_COLS = ['when', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'id', 'at', 'client_id'];
+
+// Display string for the Events `when` column (Bangkok). Noon-exact = backdate
+// placeholder → date only; any other time → `DD.MM.YYYY HH:MM`. Derived from `at`.
+function formatWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const fmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Bangkok', year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false,
+  });
+  const p = Object.fromEntries(fmt.formatToParts(d).map(x => [x.type, x.value]));
+  const date = `${p.day}.${p.month}.${p.year}`;
+  if (p.hour === '12' && p.minute === '00' && p.second === '00') return date;
+  return `${date} ${p.hour}:${p.minute}`;
+}
 
 function rowToEvent(r) {
   const cell = (i) => (r[i] === undefined || r[i] === '' ? null : r[i]);
   const num = (i) => { const v = cell(i); if (v == null) return null; return typeof v === 'number' ? v : parseFloat(v); };
+  // Column 0 is the display-only `when` string (derived from `at`) — ignored here.
   return {
-    id: cell(0) != null ? String(cell(0)) : null,
     type: cell(1) != null ? String(cell(1)) : null,
     from: cell(2) != null ? String(cell(2)) : null,
     to: cell(3) != null ? String(cell(3)) : null,
     amount: num(4),
     amount_to: num(5),
     note: cell(6) != null ? String(cell(6)) : null,
-    at: cell(7) != null ? String(cell(7)) : null,
-    client_id: cell(8) != null ? String(cell(8)) : null,
+    id: cell(7) != null ? String(cell(7)) : null,
+    at: cell(8) != null ? String(cell(8)) : null,
+    client_id: cell(9) != null ? String(cell(9)) : null,
   };
 }
 
 function eventToRow(ev) {
-  return EVENT_COLS.map((c) => { const v = ev[c]; return v == null ? '' : v; });
+  return EVENT_COLS.map((c) => {
+    if (c === 'when') return formatWhen(ev.at);
+    const v = ev[c];
+    return v == null ? '' : v;
+  });
 }
 
 // === EVENTS pure logic ===
@@ -183,15 +204,21 @@ eq(bangkokDateOf('2026-05-08T09:52:50.378Z'), '2026-05-08', 'UTC morning → sam
 eq(bangkokDateOf('2026-04-30T17:30:00Z'), '2026-05-01', 'UTC night → next Bangkok day');
 eq(bangkokDateOf('2026-05-08T12:00:00+07:00'), '2026-05-08', 'noon Bangkok offset → same day');
 
+console.log('\n=== formatWhen ===');
+eq(formatWhen('2026-05-08T12:00:00+07:00'), '08.05.2026', 'noon placeholder → date only');
+eq(formatWhen('2026-05-08T09:52:50.378Z'), '08.05.2026 16:52', 'real time → date + HH:MM (Bangkok)');
+eq(formatWhen(''), '', 'empty → empty');
+
 console.log('\n=== rowToEvent / eventToRow (round-trip) ===');
-const ev1 = { id: 'ev_abc', type: 'expense', from: 'cash', to: null, amount: 350, amount_to: null, note: 'кофе', at: '2026-05-08T12:00:00+07:00', client_id: null };
-eq(eventToRow(ev1), ['ev_abc', 'expense', 'cash', '', 350, '', 'кофе', '2026-05-08T12:00:00+07:00', ''], 'event → row (nulls become "")');
+// Keys are in rowToEvent's output order so JSON round-trip compares equal.
+const ev1 = { type: 'expense', from: 'cash', to: null, amount: 350, amount_to: null, note: 'кофе', id: 'ev_abc', at: '2026-05-08T12:00:00+07:00', client_id: null };
+eq(eventToRow(ev1), ['08.05.2026', 'expense', 'cash', '', 350, '', 'кофе', 'ev_abc', '2026-05-08T12:00:00+07:00', ''], 'event → row (when derived, nulls become "")');
 eq(rowToEvent(eventToRow(ev1)), ev1, 'row → event round-trips');
-const ev2 = { id: 'ev_x', type: 'exchange', from: 'bybit', to: 'cash', amount: 300, amount_to: 9400, note: null, at: '2026-05-08T09:52:50.378Z', client_id: 'c_123' };
+const ev2 = { type: 'exchange', from: 'bybit', to: 'cash', amount: 300, amount_to: 9400, note: null, id: 'ev_x', at: '2026-05-08T09:52:50.378Z', client_id: 'c_123' };
 eq(rowToEvent(eventToRow(ev2)), ev2, 'exchange with client_id round-trips');
 // Sheets may return numeric cells as numbers and omit trailing empties — emulate that
-eq(rowToEvent(['ev_y', 'income', '', 'bybit', 2499, '', 'ЗП', '2026-05-06T12:00:00+07:00']),
-   { id: 'ev_y', type: 'income', from: null, to: 'bybit', amount: 2499, amount_to: null, note: 'ЗП', at: '2026-05-06T12:00:00+07:00', client_id: null },
+eq(rowToEvent(['16.04.2026', 'income', '', 'bybit', 2499, '', 'ЗП', 'ev_y', '2026-05-06T12:00:00+07:00']),
+   { type: 'income', from: null, to: 'bybit', amount: 2499, amount_to: null, note: 'ЗП', id: 'ev_y', at: '2026-05-06T12:00:00+07:00', client_id: null },
    'short row (trailing empties omitted) parses with nulls');
 
 console.log('\n=== validateEvent ===');

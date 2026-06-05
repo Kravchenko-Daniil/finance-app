@@ -26,3 +26,6 @@ yarn.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Sheet backups (operator scripts) — never commit financial data
+scripts/_backups/
