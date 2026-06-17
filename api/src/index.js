@@ -18,9 +18,14 @@
 // when bucketing days (getDay) or formatting the human `when` column.
 //
 // === Sheet schema ===
-// Events  (row 1 = headers): A:when  B:type  C:from  D:to  E:amount  F:amount_to  G:note  H:id  I:at  J:client_id
+// Events  (row 1 = headers): A:when  B:type  C:from  D:to  E:amount  F:amount_to  G:note  H:id  I:at  J:client_id  K:log_only
 //   `when` is a display-only column (a short date in the configured timezone,
 //   derived from `at`); written on append, ignored on read. `at` (ISO) is truth.
+//   `log_only` (hidden boolean, col K): when TRUE the event is logged for
+//   analytics/watchdog but does NOT mutate the balance — used for accounts whose
+//   balance is mirrored by POST /api/snapshot (mutating them too would double-count).
+//   It must be PERSISTED, not inferred: PATCH/DELETE read it back to decide whether
+//   to reverse a mutation that may never have happened. See aggregator-design.md §10.
 // Balances: F1 = updated_at ISO (raw, hidden). An "Updated" line sits up top; the
 //   accounts table is found by scanning column A for the "id" header and read
 //   until the first blank row (a totals block sits below that blank, ignored).
@@ -41,7 +46,7 @@ const SETTINGS_SHEET = 'Settings';
 // Column order the API reads/writes for the Events sheet. `when` is a
 // display-only derived column (see formatWhen); every other key maps 1:1 to the
 // event object.
-const EVENT_COLS = ['when', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'id', 'at', 'client_id'];
+const EVENT_COLS = ['when', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'id', 'at', 'client_id', 'log_only'];
 
 export default {
   async fetch(req, env) {
@@ -439,6 +444,9 @@ function validateEvent(body) {
       return { ok: false, message: 'client_id must be string ≤64 chars' };
     }
   }
+  if (body.log_only !== undefined && body.log_only !== null && typeof body.log_only !== 'boolean') {
+    return { ok: false, message: 'log_only must be boolean' };
+  }
   return { ok: true };
 }
 
@@ -543,6 +551,7 @@ async function createEvent(env, body) {
     note: body.note || null,
     at: body.at ? new Date(body.at).toISOString() : new Date().toISOString(),
     client_id: clientId,
+    log_only: body.log_only === true,
   };
 
   const token = await getAccessToken(env);
@@ -568,6 +577,19 @@ async function createEvent(env, body) {
     }
   }
 
+  // log_only events are logged for analytics/watchdog but never move a balance
+  // (the account is mirrored by POST /api/snapshot — mutating it too would
+  // double-count). Append the row only and echo the balances back unchanged.
+  // NOTE: nothing here ENFORCES that a snapshot-mirrored account receives only
+  // log_only ops — that invariant is the caller's (the poller must send
+  // log_only:true). A managed-account guard (reject a balance-moving op on a
+  // mirrored account) is a future step, deferred until the pollers exist.
+  if (event.log_only) {
+    await appendEvent(env, event, token, tz);
+    const { client_id, ...publicEvent } = event;
+    return ok({ event: publicEvent, balances: { updated_at: updatedAt, accounts } });
+  }
+
   const newAccounts = applyMutation(accounts.map((a) => ({ ...a })), event);
   const newUpdatedAt = event.at;
 
@@ -586,7 +608,7 @@ async function createEvent(env, body) {
 async function handleEventDelete(env) {
   const token = await getAccessToken(env);
 
-  const [events, { accounts, dataStartRow }] = await Promise.all([
+  const [events, { accounts, dataStartRow, updatedAt: readUpdatedAt }] = await Promise.all([
     readEvents(env, token),
     readBalances(env, token),
   ]);
@@ -594,13 +616,16 @@ async function handleEventDelete(env) {
   if (events.length === 0) return error(404, 'no events to undo');
 
   const last = events[events.length - 1];
-  const newAccounts = reverseMutation(accounts.map((a) => ({ ...a })), last);
-  const updatedAt = new Date().toISOString();
+  // A log_only last event never moved the balance — skip the reverse, just drop
+  // the row.
+  const balancesChanged = !last.log_only;
+  const newAccounts = balancesChanged ? reverseMutation(accounts.map((a) => ({ ...a })), last) : accounts;
+  const updatedAt = balancesChanged ? new Date().toISOString() : readUpdatedAt;
 
   // Reverse the balance first, then drop the row. If the row delete failed the
   // log would keep a phantom entry — reversing first means balances are right
   // and a re-issued undo simply pops the same row.
-  await writeBalanceAmounts(env, newAccounts, updatedAt, token, dataStartRow);
+  if (balancesChanged) await writeBalanceAmounts(env, newAccounts, updatedAt, token, dataStartRow);
   await deleteEventRow(env, events.length + 1, token); // last event row = data count + header
 
   const { client_id, ...publicEvent } = last;
@@ -609,7 +634,7 @@ async function handleEventDelete(env) {
 
 // Fields a PATCH may change. id and client_id are immutable (the row's identity
 // and the idempotency key); `when` is derived from `at`, never set directly.
-const PATCHABLE_FIELDS = ['type', 'from', 'to', 'amount', 'amount_to', 'note', 'at'];
+const PATCHABLE_FIELDS = ['type', 'from', 'to', 'amount', 'amount_to', 'note', 'at', 'log_only'];
 
 // PATCH /api/event/:id — correct an arbitrary past event. Merges the given fields
 // over the stored event, re-validates, then rebalances by reversing the old
@@ -624,7 +649,7 @@ async function patchEventById(req, env, id) {
 
   const token = await getAccessToken(env);
   const tz = await readTimezone(env);
-  const [events, { accounts, dataStartRow }] = await Promise.all([
+  const [events, { accounts, dataStartRow, updatedAt: readUpdatedAt }] = await Promise.all([
     readEvents(env, token),
     readBalances(env, token),
   ]);
@@ -649,17 +674,27 @@ async function patchEventById(req, env, id) {
     note: merged.note || null,
     at: merged.at ? new Date(merged.at).toISOString() : old.at,
     client_id: old.client_id,
+    log_only: merged.log_only === true,
   };
 
-  // Reverse the stored event, then apply the corrected one, on one snapshot.
+  // Conditional rebalance on one snapshot. log_only events never moved the
+  // balance, so reverse the OLD only if it wasn't log_only, and apply the NEW
+  // only if it isn't log_only. Matrix:
+  //   old=false,new=false → reverse(old)+apply(new)
+  //   old=true, new=false → apply(new) only   (old never moved the balance)
+  //   old=false,new=true  → reverse(old) only (new won't move the balance)
+  //   old=true, new=true  → no-op
   let newAccounts = accounts.map((a) => ({ ...a }));
-  newAccounts = reverseMutation(newAccounts, old);
-  newAccounts = applyMutation(newAccounts, newEvent);
-  const updatedAt = new Date().toISOString();
+  if (!old.log_only) newAccounts = reverseMutation(newAccounts, old);
+  if (!newEvent.log_only) newAccounts = applyMutation(newAccounts, newEvent);
+  const balancesChanged = !old.log_only || !newEvent.log_only;
+  const updatedAt = balancesChanged ? new Date().toISOString() : readUpdatedAt;
   const rowNumber = idx + 2; // header at row 1, events start at row 2
 
+  // The log row is the source of truth — always rewrite it. Touch balances only
+  // when the rebalance actually changed something.
   await writeEventRow(env, rowNumber, newEvent, token, tz);
-  await writeBalanceAmounts(env, newAccounts, updatedAt, token, dataStartRow);
+  if (balancesChanged) await writeBalanceAmounts(env, newAccounts, updatedAt, token, dataStartRow);
 
   const { client_id, ...publicEvent } = newEvent;
   return ok({ updated: publicEvent, balances: { updated_at: updatedAt, accounts: newAccounts } });
@@ -670,7 +705,7 @@ async function patchEventById(req, env, id) {
 // a re-issued delete by id is a no-op once the row is gone), then delete the row.
 async function deleteEventById(env, id) {
   const token = await getAccessToken(env);
-  const [events, { accounts, dataStartRow }] = await Promise.all([
+  const [events, { accounts, dataStartRow, updatedAt: readUpdatedAt }] = await Promise.all([
     readEvents(env, token),
     readBalances(env, token),
   ]);
@@ -679,11 +714,14 @@ async function deleteEventById(env, id) {
   if (idx === -1) return error(404, `event not found: ${id}`);
   const target = events[idx];
 
-  const newAccounts = reverseMutation(accounts.map((a) => ({ ...a })), target);
-  const updatedAt = new Date().toISOString();
+  // A log_only event never moved the balance, so deleting it must NOT reverse
+  // anything — leave balances untouched and just drop the row.
+  const balancesChanged = !target.log_only;
+  const newAccounts = balancesChanged ? reverseMutation(accounts.map((a) => ({ ...a })), target) : accounts;
+  const updatedAt = balancesChanged ? new Date().toISOString() : readUpdatedAt;
   const rowNumber = idx + 2; // header at row 1, events start at row 2
 
-  await writeBalanceAmounts(env, newAccounts, updatedAt, token, dataStartRow);
+  if (balancesChanged) await writeBalanceAmounts(env, newAccounts, updatedAt, token, dataStartRow);
   await deleteEventRow(env, rowNumber, token);
 
   const { client_id, ...publicEvent } = target;
@@ -824,7 +862,7 @@ async function readSettings(env, token) {
 
 async function readEvents(env, token) {
   token = token || await getAccessToken(env);
-  const rows = await sheetsValuesGet(env, `${EVENTS_SHEET}!A2:J`, token);
+  const rows = await sheetsValuesGet(env, `${EVENTS_SHEET}!A2:K`, token);
   const events = [];
   for (const r of rows) {
     const ev = rowToEvent(r);
@@ -833,6 +871,10 @@ async function readEvents(env, token) {
   }
   return events;
 }
+
+// A Sheets boolean cell comes back as boolean true; a hand-typed/RAW one may be the
+// string 'TRUE'. Anything else (blank, 'FALSE', etc.) is false.
+const truthy = (v) => v === true || (typeof v === 'string' && v.trim().toUpperCase() === 'TRUE');
 
 function rowToEvent(r) {
   const cell = (i) => (r[i] === undefined || r[i] === '' ? null : r[i]);
@@ -852,12 +894,17 @@ function rowToEvent(r) {
     id: cell(7) != null ? String(cell(7)) : null,
     at: cell(8) != null ? String(cell(8)) : null,
     client_id: cell(9) != null ? String(cell(9)) : null,
+    log_only: truthy(r[10]),
   };
 }
 
 function eventToRow(ev, tz) {
   return EVENT_COLS.map((c) => {
     if (c === 'when') return formatWhen(ev.at, tz); // display-only, derived from `at`
+    // log_only: write boolean true (Sheets stores TRUE, reads back as boolean);
+    // false → blank cell (clean, like the other hidden columns). A bare `false`
+    // would otherwise land as the literal FALSE — the special-case avoids that.
+    if (c === 'log_only') return ev.log_only ? true : '';
     const v = ev[c];
     return v == null ? '' : v;
   });
@@ -911,10 +958,10 @@ async function getSheetId(env, title, token) {
   return id;
 }
 
-// Overwrites one event row in place (A:J) with the given event. Used by PATCH to
+// Overwrites one event row in place (A:K) with the given event. Used by PATCH to
 // persist a corrected event; `when` is re-derived from `at` by eventToRow.
 async function writeEventRow(env, rowNumber, event, token, tz) {
-  const range = `${EVENTS_SHEET}!A${rowNumber}:J${rowNumber}`;
+  const range = `${EVENTS_SHEET}!A${rowNumber}:K${rowNumber}`;
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`;
   const res = await fetch(url, {
     method: 'PUT',

@@ -6,7 +6,7 @@
 // frozen/hidden columns and conditional formatting, locating data by scanning.
 //
 // Layout it styles (set by migrate-schema-v2.mjs):
-//   Events   A:When B:Type C:From D:To E:Amount F:Received G:Note  | H:id I:at J:client_id (hidden)
+//   Events   A:When B:Type C:From D:To E:Amount F:Received G:Note  | H:id I:at J:client_id K:log_only (hidden)
 //   Balances A1:"Updated" B1:date | accounts header (id/name/amount/currency) below,
 //            then a Totals block. F1 = raw updated_at ISO (hidden).
 //
@@ -170,7 +170,7 @@ function boldCell(sheetId, r, c) {
   });
   reqs.push(borders(evId, 0, lastEv, 0, 7));              // A1:G{last}
   reqs.push(hidden(evId, 0, 7, false));                   // A..G visible
-  reqs.push(hidden(evId, 7, 10, true));                   // id, at, client_id hidden
+  reqs.push(hidden(evId, 7, 11, true));                   // id, at, client_id, log_only hidden (H..K)
   const evW = { 0: 130, 1: 80, 2: 120, 3: 120, 4: 95, 5: 95, 6: 240 };
   for (const [c, px] of Object.entries(evW)) reqs.push(width(evId, Number(c), px));
   // amount colored by type (Type=B, Amount=E, Received=F) — open-ended rows

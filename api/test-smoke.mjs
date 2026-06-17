@@ -64,7 +64,7 @@ function dateInZone(iso, tz) {
 
 // === Sheets row <-> event mapping (pure) ===
 
-const EVENT_COLS = ['when', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'id', 'at', 'client_id'];
+const EVENT_COLS = ['when', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'id', 'at', 'client_id', 'log_only'];
 
 // Display string for the Events `when` column (in `tz`). Noon-exact = backdate
 // placeholder → date only; any other time → `DD.MM.YYYY HH:MM`. Derived from `at`.
@@ -82,6 +82,8 @@ function formatWhen(iso, tz) {
   return `${date} ${p.hour}:${p.minute}`;
 }
 
+const truthy = (v) => v === true || (typeof v === 'string' && v.trim().toUpperCase() === 'TRUE');
+
 function rowToEvent(r) {
   const cell = (i) => (r[i] === undefined || r[i] === '' ? null : r[i]);
   const num = (i) => { const v = cell(i); if (v == null) return null; return typeof v === 'number' ? v : parseFloat(v); };
@@ -96,12 +98,14 @@ function rowToEvent(r) {
     id: cell(7) != null ? String(cell(7)) : null,
     at: cell(8) != null ? String(cell(8)) : null,
     client_id: cell(9) != null ? String(cell(9)) : null,
+    log_only: truthy(r[10]),
   };
 }
 
 function eventToRow(ev, tz) {
   return EVENT_COLS.map((c) => {
     if (c === 'when') return formatWhen(ev.at, tz);
+    if (c === 'log_only') return ev.log_only ? true : '';
     const v = ev[c];
     return v == null ? '' : v;
   });
@@ -135,6 +139,9 @@ function validateEvent(body) {
   }
   if (body.client_id !== undefined && body.client_id !== null) {
     if (typeof body.client_id !== 'string' || body.client_id.length > 64) return { ok: false, message: 'client_id must be string ≤64 chars' };
+  }
+  if (body.log_only !== undefined && body.log_only !== null && typeof body.log_only !== 'boolean') {
+    return { ok: false, message: 'log_only must be boolean' };
   }
   return { ok: true };
 }
@@ -246,15 +253,19 @@ eq(formatWhen('', TZ), '', 'empty → empty');
 
 console.log('\n=== rowToEvent / eventToRow (round-trip) ===');
 // Keys are in rowToEvent's output order so JSON round-trip compares equal.
-const ev1 = { type: 'expense', from: 'cash', to: null, amount: 350, amount_to: null, note: 'кофе', id: 'ev_abc', at: '2026-05-08T12:00:00+07:00', client_id: null };
-eq(eventToRow(ev1, TZ), ['08.05.2026', 'expense', 'cash', '', 350, '', 'кофе', 'ev_abc', '2026-05-08T12:00:00+07:00', ''], 'event → row (when derived, nulls become "")');
+const ev1 = { type: 'expense', from: 'cash', to: null, amount: 350, amount_to: null, note: 'кофе', id: 'ev_abc', at: '2026-05-08T12:00:00+07:00', client_id: null, log_only: false };
+eq(eventToRow(ev1, TZ), ['08.05.2026', 'expense', 'cash', '', 350, '', 'кофе', 'ev_abc', '2026-05-08T12:00:00+07:00', '', ''], 'event → row (when derived, nulls become "", log_only false → "")');
 eq(rowToEvent(eventToRow(ev1, TZ)), ev1, 'row → event round-trips');
-const ev2 = { type: 'exchange', from: 'bybit', to: 'cash', amount: 300, amount_to: 9400, note: null, id: 'ev_x', at: '2026-05-08T09:52:50.378Z', client_id: 'c_123' };
+const ev2 = { type: 'exchange', from: 'bybit', to: 'cash', amount: 300, amount_to: 9400, note: null, id: 'ev_x', at: '2026-05-08T09:52:50.378Z', client_id: 'c_123', log_only: false };
 eq(rowToEvent(eventToRow(ev2, TZ)), ev2, 'exchange with client_id round-trips');
+// log_only=true: row's last cell is boolean true, round-trips back to log_only:true
+const ev3 = { type: 'expense', from: 'bybit', to: null, amount: 26, amount_to: null, note: 'mirrored op', id: 'ev_lo', at: '2026-05-08T09:52:50.378Z', client_id: 'zm_42', log_only: true };
+eq(eventToRow(ev3, TZ)[10], true, 'log_only=true → row last cell is boolean true');
+eq(rowToEvent(eventToRow(ev3, TZ)), ev3, 'log_only=true event round-trips');
 // Sheets may return numeric cells as numbers and omit trailing empties — emulate that
 eq(rowToEvent(['16.04.2026', 'income', '', 'bybit', 2499, '', 'ЗП', 'ev_y', '2026-05-06T12:00:00+07:00']),
-   { type: 'income', from: null, to: 'bybit', amount: 2499, amount_to: null, note: 'ЗП', id: 'ev_y', at: '2026-05-06T12:00:00+07:00', client_id: null },
-   'short row (trailing empties omitted) parses with nulls');
+   { type: 'income', from: null, to: 'bybit', amount: 2499, amount_to: null, note: 'ЗП', id: 'ev_y', at: '2026-05-06T12:00:00+07:00', client_id: null, log_only: false },
+   'short row (trailing empties omitted) parses with nulls, log_only false');
 
 console.log('\n=== validateEvent ===');
 eq(validateEvent({ type: 'income', to: 'bybit', amount: 100 }).ok, true, 'income OK');
@@ -274,6 +285,8 @@ eq(validateEvent({ type: 'income', to: 'bybit', amount: 100, at: 'not-a-date' })
 eq(validateEvent({ type: 'income', to: 'bybit', amount: 100, at: '2099-01-01T00:00:00Z' }).ok, false, 'far future at rejected');
 eq(validateEvent({ type: 'income', to: 'bybit', amount: 100, client_id: 'abc' }).ok, true, 'client_id OK');
 eq(validateEvent({ type: 'income', to: 'bybit', amount: 100, client_id: 'x'.repeat(65) }).ok, false, 'client_id >64 rejected');
+eq(validateEvent({ type: 'income', to: 'bybit', amount: 100, log_only: true }).ok, true, 'log_only boolean OK');
+eq(validateEvent({ type: 'income', to: 'bybit', amount: 100, log_only: 'yes' }).ok, false, 'log_only non-boolean rejected');
 
 console.log('\n=== applyMutation / reverseMutation ===');
 let a = sampleAccounts();
@@ -357,6 +370,59 @@ applyMutation(a, oldInc); // bybit 3499
 applyEdit(a, oldInc, { type: 'expense', from: 'cash', amount: 1000 }); // change type + account
 eq(acc(a, 'bybit'), 1000, 'edit reverts wrong income off bybit');
 eq(acc(a, 'cash'), 4000, 'edit applies corrected expense on cash');
+
+console.log('\n=== PATCH log_only matrix (conditional reverse/apply) ===');
+// Mirrors patchEventById: reverse OLD only if !old.log_only, apply NEW only if
+// !new.log_only — a log_only event never moved the balance.
+const applyPatch = (accs, oldEv, newEv) => {
+  let a = accs;
+  if (!oldEv.log_only) a = reverseMutation(a, oldEv);
+  if (!newEv.log_only) a = applyMutation(a, newEv);
+  return a;
+};
+
+// both false: normal expense 600 (live 400) → patch to expense 500 → bybit 500.
+a = sampleAccounts();
+const pOldF = { type: 'expense', from: 'bybit', amount: 600, log_only: false };
+applyMutation(a, pOldF); // live: bybit 400
+applyPatch(a, pOldF, { type: 'expense', from: 'bybit', amount: 500, log_only: false });
+eq(acc(a, 'bybit'), 500, 'patch both-false: 600→500 leaves bybit 500');
+
+// old log_only true → new false: live bybit 1000 (log_only never moved it) →
+// patch to normal expense 500 → bybit 500 (apply only, no reverse).
+a = sampleAccounts(); // bybit 1000, old log_only never mutated it
+const pOldLO = { type: 'expense', from: 'bybit', amount: 600, log_only: true };
+applyPatch(a, pOldLO, { type: 'expense', from: 'bybit', amount: 500, log_only: false });
+eq(acc(a, 'bybit'), 500, 'patch old-logonly→normal: apply only → bybit 500');
+
+// old false → new log_only true: normal expense 600 applied (live 400) → patch to
+// log_only → reverse only → bybit back to 1000.
+a = sampleAccounts();
+const pOldN = { type: 'expense', from: 'bybit', amount: 600, log_only: false };
+applyMutation(a, pOldN); // live: bybit 400
+applyPatch(a, pOldN, { type: 'expense', from: 'bybit', amount: 600, log_only: true });
+eq(acc(a, 'bybit'), 1000, 'patch normal→logonly: reverse only → bybit 1000');
+
+// both true: balance untouched (1000).
+a = sampleAccounts();
+const pBothLO_old = { type: 'expense', from: 'bybit', amount: 600, log_only: true };
+applyPatch(a, pBothLO_old, { type: 'expense', from: 'bybit', amount: 500, log_only: true });
+eq(acc(a, 'bybit'), 1000, 'patch both-logonly: no-op → bybit 1000');
+
+console.log('\n=== DELETE log_only matrix (conditional reverse) ===');
+// Mirrors deleteEventById: reverse only when !target.log_only.
+const applyDelete = (accs, target) => (target.log_only ? accs : reverseMutation(accs, target));
+
+a = sampleAccounts();
+const dNormal = { type: 'expense', from: 'bybit', amount: 600, log_only: false };
+applyMutation(a, dNormal); // live: bybit 400
+applyDelete(a, dNormal);
+eq(acc(a, 'bybit'), 1000, 'delete normal expense: reverse → bybit 1000');
+
+a = sampleAccounts(); // log_only never mutated: bybit 1000
+const dLO = { type: 'expense', from: 'bybit', amount: 600, log_only: true };
+applyDelete(a, dLO);
+eq(acc(a, 'bybit'), 1000, 'delete log_only expense: no reverse → bybit stays 1000');
 
 console.log(`\n=== ${pass} pass, ${fail} fail ===`);
 process.exit(fail === 0 ? 0 : 1);
