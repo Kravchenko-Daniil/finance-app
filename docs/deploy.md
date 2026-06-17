@@ -50,7 +50,7 @@ The web app and API share a single domain (same-origin). The web app fetches rel
 7. Grab the spreadsheet id from its URL: `docs.google.com/spreadsheets/d/`**`<THIS>`**`/edit`.
 
 > Seed the tabs by hand (or with the operator scripts in `scripts/`):
-> - `Events` — header row `when | type | from | to | amount | amount_to | note | at | client_id` (the API keys off the column order; `id`/`at`/`client_id` are kept hidden).
+> - `Events` — header row `when | type | from | to | amount | amount_to | note | id | at | client_id | log_only` (the API keys off the column order; `id`/`at`/`client_id`/`log_only` are kept hidden). `log_only=TRUE` logs an event without moving a balance (for snapshot-mirrored accounts).
 > - `Balances` — an accounts table whose header row has `id` in column A (the API finds it by scanning for that header); columns `id | name | amount | currency`, one row per account, with an `Updated` line above and an optional `Totals` block below.
 > - `Settings` — two rows mapping `primary_account` and `primary_currency` (column A = key, column C = value: an account id and a currency). The `PRIMARY_ACCOUNT` / `PRIMARY_CURRENCY` env vars are the fallback if this tab is absent.
 

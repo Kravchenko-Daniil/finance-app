@@ -43,7 +43,7 @@ Same-origin: the web app fetches relative paths `/api/...` — no CORS, and the 
 
 Three tabs:
 
-- **`Events`** — append-only event log. Columns: `when | type | from | to | amount | amount_to | note | at | client_id` (the `id`, `at` and `client_id` columns are hidden; `when` is a derived human-readable date). Types: `income | expense | transfer | exchange`.
+- **`Events`** — append-only event log. Columns: `when | type | from | to | amount | amount_to | note | id | at | client_id | log_only` (the `id`, `at`, `client_id` and `log_only` columns are hidden; `when` is a derived human-readable date). Types: `income | expense | transfer | exchange`. `log_only` (boolean, column K) logs an event without moving any balance — used for accounts mirrored via `POST /api/snapshot`, where a normal mutation would double-count.
 - **`Balances`** — current balance per account. The accounts table is located by scanning column A for an `id` header (the `id` column is hidden — it's the key that `from`/`to` reference); the visible columns are name / amount / currency. An "Updated" line sits on top and a `Totals` block (one `SUMIF` per currency) below. The API mutates only the `amount` column and the timestamp cell.
 - **`Settings`** — the primary (everyday) account and currency, used for a quick-expense typed without a currency token. The API reads it at runtime; the `PRIMARY_ACCOUNT` / `PRIMARY_CURRENCY` env vars are the fallback.
 
