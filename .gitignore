@@ -21,6 +21,14 @@ node_modules/
 package-lock.json
 yarn.lock
 
+# Python poller venv (Telethon etc.) — local-only, never commit
+scripts/.venv/
+scripts/.state/
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 Thumbs.db

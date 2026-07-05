@@ -1,0 +1,27 @@
+# systemd unit для MaxSwap-листенера (always-on на VPS).
+# Установка: подставить ПУТЬ и пользователя, скопировать в /etc/systemd/system/,
+# затем: sudo systemctl daemon-reload && sudo systemctl enable --now maxswap-listener
+# Логи: journalctl -u maxswap-listener -f
+#
+# Предпосылки на VPS:
+#   1) репозиторий склонирован (или папка scripts/ скопирована) в <APP_DIR>
+#   2) venv: python3 -m venv scripts/.venv && scripts/.venv/bin/pip install -r scripts/requirements-pollers.txt
+#   3) .env в корне <APP_DIR> с TELEGRAM_API_ID/HASH/SESSION + APP_TOKEN
+#   4) курсор: scripts/.state/maxswap.json с актуальным last_msg_id (иначе первый
+#      запуск сделает catch-up с 0 и зальёт историю — выставить вручную или скопировать с локали)
+
+[Unit]
+Description=MaxSwap Telegram listener -> finance-API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_USER
+WorkingDirectory=REPLACE_APP_DIR/scripts
+ExecStart=REPLACE_APP_DIR/scripts/.venv/bin/python maxswap_listener.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
