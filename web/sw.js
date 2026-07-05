@@ -1,4 +1,4 @@
-const CACHE = 'finance-app-v22';
+const CACHE = 'finance-app-v23';
 const FILES = ['./', './index.html', './app.js', './config.js', './balances.html', './balances.js', './events.html', './events.js', './expenses.html', './expenses.js', './manifest.json', './icon.svg'];
 
 self.addEventListener('install', (e) => {
