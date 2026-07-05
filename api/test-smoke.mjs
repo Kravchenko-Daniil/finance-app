@@ -111,6 +111,19 @@ function eventToRow(ev, tz) {
   });
 }
 
+// Inline copy of the per-account mapping inside readBalances (src/index.js): turns a
+// Balances row (id/name/amount/currency + hidden marker in column G/index 6) into an
+// account object. Kept in sync with src/index.js.
+function balanceRowToAccount(r) {
+  return {
+    id: String(r[0]),
+    name: r[1] != null ? String(r[1]) : '',
+    amount: typeof r[2] === 'number' ? r[2] : parseFloat(r[2]) || 0,
+    currency: r[3] != null ? String(r[3]) : '',
+    hidden: truthy(r[6]),
+  };
+}
+
 // === EVENTS pure logic ===
 
 function validateEvent(body) {
@@ -266,6 +279,16 @@ eq(rowToEvent(eventToRow(ev3, TZ)), ev3, 'log_only=true event round-trips');
 eq(rowToEvent(['16.04.2026', 'income', '', 'bybit', 2499, '', 'ЗП', 'ev_y', '2026-05-06T12:00:00+07:00']),
    { type: 'income', from: null, to: 'bybit', amount: 2499, amount_to: null, note: 'ЗП', id: 'ev_y', at: '2026-05-06T12:00:00+07:00', client_id: null, log_only: false },
    'short row (trailing empties omitted) parses with nulls, log_only false');
+
+console.log('\n=== Balances row → account (hidden marker, column G) ===');
+// G as Sheets boolean true → hidden:true
+eq(balanceRowToAccount(['bybit', 'Bybit', 0, 'USDT', '', '', true]).hidden, true, 'G boolean true → hidden:true');
+// G as RAW string 'TRUE' → hidden:true
+eq(balanceRowToAccount(['cash', 'Cash', 100, 'THB', '', '', 'TRUE']).hidden, true, "G string 'TRUE' → hidden:true");
+// G as empty string → hidden:false
+eq(balanceRowToAccount(['bidv', 'BIDV', 792964, 'VND', '', '', '']).hidden, false, "G empty string → hidden:false");
+// G absent (short row) → hidden:false
+eq(balanceRowToAccount(['tbank_debit', 'T-Bank', 5000, 'RUB']).hidden, false, 'G absent → hidden:false');
 
 console.log('\n=== validateEvent ===');
 eq(validateEvent({ type: 'income', to: 'bybit', amount: 100 }).ok, true, 'income OK');

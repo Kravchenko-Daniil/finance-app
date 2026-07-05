@@ -49,7 +49,24 @@
     .topbtn:active, #gear:active { transform: scale(0.92); }
     .topbtn svg, #gear svg { width: 22px; height: 22px; }
     #gear { position: fixed; top: max(env(safe-area-inset-top), 0.5rem); right: 0.5rem; z-index: 10; }
-    #accounts { display: flex; flex-direction: column; gap: 0.6rem; }
+    #accounts, #hiddenAccounts { display: flex; flex-direction: column; gap: 0.6rem; }
+    /* Текстовая кнопка-тогл «прочее» — ненавязчивая, не конкурирует с карточками. */
+    .toggle {
+      align-self: center;
+      background: transparent;
+      color: #f0f0f0;
+      opacity: 0.45;
+      border: 0;
+      padding: 0.35rem 0.6rem;
+      font-family: inherit;
+      font-size: 0.85rem;
+      cursor: pointer;
+      letter-spacing: 0.02em;
+    }
+    .toggle:active { opacity: 0.7; }
+    /* Долги (отрицательный баланс в скрытом блоке) — приглушённо-красный акцент суммы. */
+    .row.debt .amount { color: #e08a8a; }
+    .row.debt { border-color: #2a1d1d; }
     .row {
       display: flex;
       justify-content: space-between;
@@ -148,6 +165,8 @@
   <main>
     <h1>Балансы</h1>
     <div id="accounts"></div>
+    <button type="button" id="toggleHidden" class="toggle" hidden>показать прочее ▾</button>
+    <div id="hiddenAccounts" hidden></div>
     <div id="status"></div>
     <div id="updated"></div>
   </main>

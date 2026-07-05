@@ -804,14 +804,19 @@ async function sheetsValuesGet(env, range, token) {
   return data.values || [];
 }
 
+// A Sheets boolean cell comes back as boolean true; a hand-typed/RAW one may be the
+// string 'TRUE'. Anything else (blank, 'FALSE', etc.) is false. Shared by the
+// Balances `hidden` marker column and the Events `log_only` column.
+const truthy = (v) => v === true || (typeof v === 'string' && v.trim().toUpperCase() === 'TRUE');
+
 async function readBalances(env, token) {
   token = token || await getAccessToken(env);
-  // A1:F covers the accounts (id/name/amount/currency) plus the raw updated_at at
-  // F1. The accounts table no longer starts at row 1: find its header by scanning
-  // column A for "id", then read rows until the first blank (a totals block lives
-  // below that blank and must not be read as accounts). dataStartRow (1-based) is
-  // returned so the writer targets the right amount cells.
-  const rows = await sheetsValuesGet(env, `${BALANCES_SHEET}!A1:F`, token);
+  // A1:G covers the accounts (id/name/amount/currency + a `hidden` marker in G)
+  // plus the raw updated_at at F1. The accounts table no longer starts at row 1:
+  // find its header by scanning column A for "id", then read rows until the first
+  // blank (a totals block lives below that blank and must not be read as accounts).
+  // dataStartRow (1-based) is returned so the writer targets the right amount cells.
+  const rows = await sheetsValuesGet(env, `${BALANCES_SHEET}!A1:G`, token);
   const updatedAt = (rows[0] && rows[0][5] != null && rows[0][5] !== '') ? String(rows[0][5]) : null;
   let headerIdx = -1;
   for (let i = 0; i < rows.length; i++) {
@@ -828,6 +833,7 @@ async function readBalances(env, token) {
       name: r[1] != null ? String(r[1]) : '',
       amount: typeof r[2] === 'number' ? r[2] : parseFloat(r[2]) || 0,
       currency: r[3] != null ? String(r[3]) : '',
+      hidden: truthy(r[6]),
     });
   }
   return { accounts, updatedAt, dataStartRow: headerIdx + 2 };
@@ -871,10 +877,6 @@ async function readEvents(env, token) {
   }
   return events;
 }
-
-// A Sheets boolean cell comes back as boolean true; a hand-typed/RAW one may be the
-// string 'TRUE'. Anything else (blank, 'FALSE', etc.) is false.
-const truthy = (v) => v === true || (typeof v === 'string' && v.trim().toUpperCase() === 'TRUE');
 
 function rowToEvent(r) {
   const cell = (i) => (r[i] === undefined || r[i] === '' ? null : r[i]);

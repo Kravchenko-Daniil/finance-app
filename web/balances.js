@@ -42,30 +42,51 @@ function setStatus(text, cls = '') {
   el.className = cls;
 }
 
+function makeRow(acc, { primary = null } = {}) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  if (primary && acc.id === primary) row.classList.add('primary');
+  // В скрытом блоке отрицательные суммы — это долги, выделяем их визуально.
+  if ((acc.amount || 0) < 0) row.classList.add('debt');
+  const cur = CURRENCY_DISPLAY[acc.currency] || acc.currency || '';
+  row.innerHTML = `
+    <span class="name">${escapeHtml(acc.name || acc.id || '?')}</span>
+    <span class="amount"><span class="num">${fmtAmount(acc.amount || 0)}</span><span class="currency">${escapeHtml(cur)}</span></span>
+  `;
+  return row;
+}
+
 function render(data) {
   const list = $('accounts');
   list.innerHTML = '';
-  let accounts = Array.isArray(data.accounts) ? data.accounts.slice() : [];
+  const accounts = Array.isArray(data.accounts) ? data.accounts.slice() : [];
+  // Ликвидные счета — в основном списке; скрытые (долги/вклад) — в блоке «прочее».
+  const liquid = accounts.filter((a) => !a.hidden);
+  const hidden = accounts.filter((a) => a.hidden);
+
   // Everyday account (env.PRIMARY_ACCOUNT) floats to the top, highlighted.
   const primary = data.primary || null;
   if (primary) {
-    accounts.sort((a, b) => (a.id === primary ? -1 : 0) - (b.id === primary ? -1 : 0));
+    liquid.sort((a, b) => (a.id === primary ? -1 : 0) - (b.id === primary ? -1 : 0));
   }
-  if (accounts.length === 0) {
+  if (liquid.length === 0) {
     list.innerHTML = '<div class="row"><span class="name" style="opacity:0.5">пусто</span></div>';
   } else {
-    for (const acc of accounts) {
-      const row = document.createElement('div');
-      row.className = 'row';
-      if (primary && acc.id === primary) row.classList.add('primary');
-      const cur = CURRENCY_DISPLAY[acc.currency] || acc.currency || '';
-      row.innerHTML = `
-        <span class="name">${escapeHtml(acc.name || acc.id || '?')}</span>
-        <span class="amount"><span class="num">${fmtAmount(acc.amount || 0)}</span><span class="currency">${escapeHtml(cur)}</span></span>
-      `;
-      list.appendChild(row);
-    }
+    for (const acc of liquid) list.appendChild(makeRow(acc, { primary }));
   }
+
+  const hiddenList = $('hiddenAccounts');
+  const toggle = $('toggleHidden');
+  hiddenList.innerHTML = '';
+  if (hidden.length > 0) {
+    for (const acc of hidden) hiddenList.appendChild(makeRow(acc));
+    toggle.hidden = false;
+  } else {
+    // Нет скрытых счетов — прячем и кнопку, и контейнер.
+    toggle.hidden = true;
+    hiddenList.hidden = true;
+  }
+
   $('updated').textContent = fmtUpdatedAt(data.updated_at);
   setStatus('');
 }
@@ -126,6 +147,14 @@ $('save-config').addEventListener('click', async () => {
   await AppConfig.saveTimezone($('tz-select').value);
   overlay.classList.remove('open');
   load();
+});
+
+// «Прочее» (долги + вклад) свёрнуто по умолчанию; раскрытие не персистится.
+$('toggleHidden').addEventListener('click', () => {
+  const hiddenList = $('hiddenAccounts');
+  const collapsed = hiddenList.hidden;
+  hiddenList.hidden = !collapsed;
+  $('toggleHidden').textContent = collapsed ? 'скрыть прочее ▴' : 'показать прочее ▾';
 });
 
 window.addEventListener('focus', load);

@@ -209,10 +209,10 @@ function boldCell(sheetId, r, c) {
   reqs.push(borders(balId, headerRow, dataEnd, 0, 4));   // accounts table
   reqs.push(borders(balId, 0, 1, 1, 3));                 // Updated box (B1:C1)
   reqs.push(borders(balId, totalsHeader, totalsEnd, 1, 3)); // totals box (B:C)
-  // hide the id column (A) and raw machinery (E spacer, F raw ISO); show B..D
+  // hide the id column (A) and raw machinery (E spacer, F raw ISO, G hidden-marker); show B..D
   reqs.push(hidden(balId, 0, 1, true));
   reqs.push(hidden(balId, 1, 4, false));
-  reqs.push(hidden(balId, 4, 6, true));
+  reqs.push(hidden(balId, 4, 7, true));
   const balW = { 0: 60, 1: 175, 2: 110, 3: 90 };
   for (const [c, px] of Object.entries(balW)) reqs.push(width(balId, Number(c), px));
 
