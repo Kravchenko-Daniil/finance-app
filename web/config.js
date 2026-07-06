@@ -118,5 +118,5 @@ window.AppConfig = (function () {
     return tz();
   }
 
-  return { ZONES, tz, today, dateOf, zonedNoonISO, cacheFrom, populateSelect, fetchConfig, saveTimezone };
+  return { ZONES, token, tz, today, dateOf, zonedNoonISO, cacheFrom, populateSelect, fetchConfig, saveTimezone };
 })();

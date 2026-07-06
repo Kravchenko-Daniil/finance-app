@@ -51,16 +51,6 @@
   (() => {
     'use strict';
 
-    // config.js defines token() but forgot to expose it in the returned AppConfig
-    // object, so AppConfig.token is undefined and AppConfig.token() throws. The 4
-    // nav screens survive it (their loaders are async → the throw is a swallowed
-    // rejection), but renderSettings() evaluates AppConfig.token() synchronously
-    // while building settings-host.innerHTML, so the throw aborts the assignment
-    // and the sheet never mounts. Restore the accessor (same impl as config.js).
-    if (typeof AppConfig.token !== 'function') {
-      AppConfig.token = () => localStorage.getItem('appToken') || '';
-    }
-
     const ACC = '#0abab5';
     const SPRING = 'cubic-bezier(0.34,1.56,0.64,1)';
     const EASE_OUT = 'cubic-bezier(0.22,1,0.36,1)';
