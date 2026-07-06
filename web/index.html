@@ -267,7 +267,6 @@
           const cur = curSymbol(a.currency);
           const nameRow = `<div style="display:flex;align-items:baseline;gap:0.5rem;margin-bottom:0.4rem;">
               <span style="text-transform:uppercase;letter-spacing:0.1em;font-size:0.68rem;opacity:0.4;">${ea(a.name || a.id)}</span>
-              ${isMain ? '<span style="text-transform:uppercase;letter-spacing:0.1em;font-size:0.58rem;opacity:0.3;">основной</span>' : ''}
             </div>`;
           const rowStyle = isMain ? 'padding:0 0 1.6rem;border-bottom:1px solid #1f1f1f;' : 'padding:1.4rem 0;border-bottom:1px solid #141414;';
           const amtStyle = `font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-0.03em;line-height:1;font-size:${isMain ? '3.2rem' : '1.75rem'};color:${isMain ? ACC : '#f0f0f0'};`;
