@@ -358,16 +358,21 @@
       const tabs = `<div style="display:flex;gap:1.5rem;border-bottom:1px solid #171717;">
         ${tab('income', 'Пришло')}${tab('expense', 'Расход')}${tab('exchange', 'Обмен')}${tab('transfer', 'Перевод')}</div>`;
 
-      const accList = (selId, role) => (state.accounts || []).filter((a) => !a.hidden).map((a) => {
-        const selected = selId === a.id;
-        const nameStyle = `font-weight:${selected ? 600 : 400};color:${selected ? ACC : '#f0f0f0'};`;
-        return `<button data-role="${role}" data-id="${a.id}" style="display:flex;align-items:baseline;justify-content:space-between;width:100%;padding:0.9rem 0;background:none;border:none;border-bottom:1px solid #171717;cursor:pointer;text-align:left;transition:transform .25s ${SPRING};color:#f0f0f0;font-size:1.05rem;">
-          <span style="${nameStyle}">${ea(a.name)}</span>
-          <span style="opacity:0.4;font-size:0.85rem;font-variant-numeric:tabular-nums;">${disp(a.amount, curSymbol(a.currency))}</span>
-        </button>`;
-      }).join('');
-      const fromBlock = showFrom ? `<div><div class="lbl-f" style="margin-bottom:0.6rem;">${fromLabel}</div><div>${accList(state.evFrom, 'from')}</div></div>` : '';
-      const toBlock = showTo ? `<div><div class="lbl-f" style="margin-bottom:0.6rem;">Куда</div><div>${accList(state.evTo, 'to')}</div></div>` : '';
+      // Выбор счёта — грид карточек с переносом строк (гибрид авто-ширины,
+      // портирован из Claude Design). Имя сверху, баланс снизу; выбранная —
+      // бирюзовая рамка + подсветка. flex-wrap держит оба списка «Обмена» без скролла.
+      const accList = (selId, role) => {
+        const cards = (state.accounts || []).filter((a) => !a.hidden).map((a) => {
+          const on = selId === a.id;
+          return `<button data-role="${role}" data-id="${a.id}" style="display:flex;flex-direction:column;gap:4px;align-items:flex-start;text-align:left;background:${on ? 'rgba(10,186,181,0.1)' : '#111'};border:1px solid ${on ? ACC : '#1c1c1c'};border-radius:12px;padding:0.65rem 0.9rem;cursor:pointer;transition:transform .25s ${SPRING},background .2s,border-color .2s;color:#f0f0f0;">
+            <span style="font-size:1rem;font-weight:${on ? 600 : 500};color:${on ? ACC : '#f0f0f0'};">${ea(a.name)}</span>
+            <span style="font-size:0.75rem;opacity:0.45;font-variant-numeric:tabular-nums;">${disp(a.amount, curSymbol(a.currency))}</span>
+          </button>`;
+        }).join('');
+        return `<div style="display:flex;flex-wrap:wrap;gap:0.55rem;">${cards}</div>`;
+      };
+      const fromBlock = showFrom ? `<div><div class="lbl-f" style="margin-bottom:0.6rem;">${fromLabel}</div>${accList(state.evFrom, 'from')}</div>` : '';
+      const toBlock = showTo ? `<div><div class="lbl-f" style="margin-bottom:0.6rem;">Куда</div>${accList(state.evTo, 'to')}</div>` : '';
 
       const amountField = (id, label, unit, val) =>
         `<div style="flex:1;"><div class="lbl-f" style="margin-bottom:0.5rem;">${label}</div>

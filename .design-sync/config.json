@@ -1,0 +1,5 @@
+{
+  "projectId": "e560703d-bdf4-43b9-9d58-fe56f3b8b653",
+  "projectName": "Финансы — экраны",
+  "note": "Не полноценная дизайн-система, а точечный синк отдельных экранов из web/index.html. Экран «Новое событие» = функция BODY.events() в web/index.html; превью-версия — components/events/new-event.html (демо-данные вместо API)."
+}
