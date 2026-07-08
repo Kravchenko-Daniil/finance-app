@@ -454,15 +454,34 @@
     }
 
     // ── RECURRING (регулярные платежи) ──────────────────────────────────
-    // Статус-иконка + цвет по статусу из GET /api/recurring. Помимо done/
-    // partial/pending/overdue есть partial-overdue — обещанная доплата просрочена.
-    const REC_STATUS = {
-      done:              { icon: '✓', color: '#5fd37e' },
-      partial:           { icon: '◐', color: ACC },
-      'partial-overdue': { icon: '◐', color: '#e87171' },
-      pending:           { icon: '○', color: 'rgba(240,240,240,0.7)' },
-      overdue:           { icon: '⚠', color: '#e87171' },
+    // Кастомный SVG-набор статус-иконок по статусу из GET /api/recurring. Единый
+    // язык: кольцо-оправа r=9.25 + внутренний знак, штрих 1.75, viewBox 24, ровный
+    // baseline. Заливка = насколько погашено (диск+галка / нижний полукруг), часы =
+    // ждёт срока, восклицание = просрочено. Помимо done/partial/pending/overdue
+    // есть partial-overdue — обещанная доплата просрочена.
+    const REC_COLOR = {
+      done: '#5fd37e', partial: ACC, 'partial-overdue': '#e87171',
+      pending: '#8b9196', overdue: '#e87171',
     };
+    function recIcon(status, px) {
+      const c = REC_COLOR[status] || REC_COLOR.pending;
+      const ring = `<circle cx="12" cy="12" r="9.25" fill="none" stroke="${c}" stroke-width="1.75"/>`;
+      let disc = '', mark = '';
+      if (status === 'done') {
+        disc = `<circle cx="12" cy="12" r="9.25" fill="${c}" fill-opacity="0.14"/>`;
+        mark = `<path d="M7.9 12.4 l2.7 2.7 L16.3 8.9" fill="none" stroke="${c}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>`;
+      } else if (status === 'partial' || status === 'partial-overdue') {
+        disc = `<path d="M2.75 12 A9.25 9.25 0 0 0 21.25 12 Z" fill="${c}" fill-opacity="0.9"/>`;
+        mark = `<line x1="2.75" y1="12" x2="21.25" y2="12" stroke="${c}" stroke-width="1.75" stroke-linecap="round"/>`;
+      } else if (status === 'pending') {
+        mark = `<path d="M12 12 V7.3 M12 12 L15.3 13.5" fill="none" stroke="${c}" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="1.15" fill="${c}"/>`;
+      } else if (status === 'overdue') {
+        disc = `<circle cx="12" cy="12" r="9.25" fill="${c}" fill-opacity="0.1"/>`;
+        mark = `<line x1="12" y1="6.9" x2="12" y2="12.9" stroke="${c}" stroke-width="1.9" stroke-linecap="round"/><circle cx="12" cy="16" r="1.05" fill="${c}"/>`;
+      }
+      const s = px || 30;
+      return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" style="flex-shrink:0;display:block;">${disc}${ring}${mark}</svg>`;
+    }
     // Дата YYYY-MM-DD → «20 июля» (UTC-парс, только форматирование; вся
     // календарная логика — на бэке).
     function fmtDate(ymd) {
@@ -490,15 +509,14 @@
         rows = `<div style="opacity:0.3;padding:2rem 0;font-size:1.05rem;">${state.recurringLoaded ? 'нет платежей' : 'загрузка…'}</div>`;
       } else {
         rows = items.map((item, i) => {
-          const st = REC_STATUS[item.status] || REC_STATUS.pending;
           const cur = curSymbol(item.currency);
           return `<button data-id="${ea(item.id)}" style="display:flex;align-items:center;gap:0.9rem;width:100%;text-align:left;background:#111;border:1px solid #1c1c1c;border-radius:12px;padding:1rem 1.1rem;cursor:pointer;color:#f0f0f0;animation:rowIn .38s both ${EASE_OUT};animation-delay:${i * 55}ms;transition:transform .25s ${SPRING},border-color .2s;">
-            <span style="flex-shrink:0;display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;font-size:1rem;line-height:1;color:${st.color};border:1.5px solid ${st.color};">${st.icon}</span>
+            ${recIcon(item.status, 30)}
             <div style="flex:1;min-width:0;">
               <div style="font-size:1.05rem;font-weight:600;letter-spacing:-0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(item.name || item.id)}</div>
               <div style="opacity:0.45;font-size:0.78rem;margin-top:0.25rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(recSub(item))}</div>
             </div>
-            <div style="flex-shrink:0;font-weight:600;font-size:1.35rem;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;color:${item.owed > 0 ? '#f0f0f0' : '#5fd37e'};">${disp(item.owed, cur)}</div>
+            <div style="flex-shrink:0;font-weight:600;font-size:1.35rem;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;color:${item.owed > 0 ? '#f0f0f0' : '#5fd37e'};">${disp(item.amount, cur)}</div>
           </button>`;
         }).join('');
       }
@@ -599,7 +617,6 @@
         closePaySheet();
         if (state.screen === 'recurring') renderBody();
         showToast(recPaySummary(item, body), state.pendingRecurringUndo.prev ? { undo: undoRecurring } : {});
-        loadRecurring();
       } catch {
         showToast('Нет соединения');
         ps.submitting = false; setBusy(false);
