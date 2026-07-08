@@ -43,10 +43,14 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 const EVENTS_SHEET = 'Events';
 const BALANCES_SHEET = 'Balances';
 const SETTINGS_SHEET = 'Settings';
+const RECURRING_SHEET = 'Recurring';
 // Column order the API reads/writes for the Events sheet. `when` is a
 // display-only derived column (see formatWhen); every other key maps 1:1 to the
 // event object.
 const EVENT_COLS = ['when', 'type', 'from', 'to', 'amount', 'amount_to', 'note', 'id', 'at', 'client_id', 'log_only'];
+// Column order for the Recurring sheet (monthly obligations tracker). Header is
+// fixed at row 1; `id` and `cycle` are hidden machine columns.
+const RECURRING_COLS = ['id', 'name', 'amount', 'currency', 'due_day', 'owed', 'last_paid', 'next_due', 'cycle'];
 
 export default {
   async fetch(req, env) {
@@ -75,6 +79,14 @@ export default {
         const id = decodeURIComponent(idMatch[1]);
         if (req.method === 'PATCH') return await patchEventById(req, env, id);
         if (req.method === 'DELETE') return await deleteEventById(env, id);
+      }
+      // Recurring payments tracker (monthly obligations; does NOT move balances).
+      if (req.method === 'GET' && url.pathname === '/api/recurring') return await getRecurring(env);
+      const recMatch = url.pathname.match(/^\/api\/recurring\/([^/]+)(\/pay)?$/);
+      if (recMatch) {
+        const id = decodeURIComponent(recMatch[1]);
+        if (recMatch[2] && req.method === 'POST') return await payRecurring(req, env, id);
+        if (!recMatch[2] && req.method === 'PATCH') return await patchRecurring(req, env, id);
       }
     } catch (e) {
       return error(502, `sheets: ${e.message}`);
@@ -198,6 +210,84 @@ function formatWhen(iso, tz) {
   const date = `${p.day}.${p.month}.${p.year}`;
   if (p.hour === '12' && p.minute === '00' && p.second === '00') return date;
   return `${date} ${p.hour}:${p.minute}`;
+}
+
+// === RECURRING PAYMENTS (pure debt-accrual / status logic) ===
+//
+// The Recurring sheet is a schedule of monthly obligations (credit payments). It
+// does NOT move any balance — balances are tracked separately (ZenMoney debt
+// accounts on Balances). Model "Б": every month a credit's monthly norm (`amount`)
+// is added to its running debt, whether or not the user paid — the unpaid tail
+// carries over. Accrual is LAZY and computed on read relative to the `cycle`
+// anchor (a YYYY-MM marker for the month whose norm is already folded into `owed`
+// on the sheet). GET has no side effects; any write (a payment) rolls the debt
+// forward to the current month and persists.
+
+const round2 = (x) => Math.round(x * 100) / 100;
+
+const monthIndex = (ym) => { const [y, m] = String(ym).split('-').map(Number); return y * 12 + (m - 1); };
+const monthsElapsed = (fromYM, toYM) => Math.max(0, monthIndex(toYM) - monthIndex(fromYM));
+const daysInMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();      // m: 1-based
+const clampDay = (y, m, d) => Math.min(d, daysInMonth(y, m));
+const addMonthYM = (ym, k) => { const idx = monthIndex(ym) + k; return `${Math.floor(idx / 12)}-${pad((idx % 12) + 1)}`; };
+const ymdToUTC = (ymd) => { const [y, m, d] = String(ymd).split('-').map(Number); return Date.UTC(y, m - 1, d); };
+const daysBetween = (fromYMD, toYMD) => Math.round((ymdToUTC(toYMD) - ymdToUTC(fromYMD)) / 86400000);
+
+// Lazy accrual of the running debt up to `curYM`. An empty `cycle` is a degraded
+// safe fallback: no accrual, owed stays as the raw sheet value (the seeder always
+// fills `cycle`, so this only guards a hand-edit mistake). With a `cycle`, the debt
+// grows by the monthly norm for every elapsed month — even with zero payments.
+function accrue(rec, curYM) {
+  if (!rec.cycle) return { owed: round2(rec.owed || 0), cycle: curYM, accrued: 0 };
+  const k = monthsElapsed(rec.cycle, curYM);
+  const accrued = round2((rec.amount || 0) * k);
+  return { owed: round2((rec.owed || 0) + accrued), cycle: curYM, accrued };
+}
+
+// Derives the display status + next payment date for a credit relative to today.
+// `next_date` is defined in EVERY branch (else days_until would be NaN on the
+// front). "due_day of next month" is clamped by NEXT month's day count (not the
+// current one) — otherwise due_day=31, curYM=2026-01 would yield 2026-02-31.
+function computeRecurringStatus(rec, todayYMD) {
+  const curYM = todayYMD.slice(0, 7);
+  const [cy, cm] = curYM.split('-').map(Number);
+  const owed = accrue(rec, curYM).owed;
+  const dueDate = `${curYM}-${pad(clampDay(cy, cm, rec.due_day))}`;
+  const nextYM = addMonthYM(curYM, 1);
+  const [ny, nm] = nextYM.split('-').map(Number);
+  const dueNextMonth = `${nextYM}-${pad(clampDay(ny, nm, rec.due_day))}`;
+  const paidThisCycle = !!(rec.last_paid && String(rec.last_paid).slice(0, 7) === curYM);
+  const nextDue = rec.next_due || null;
+
+  let status, next_date;
+  if (owed <= 0) {
+    status = 'done';
+    next_date = dueNextMonth;
+  } else if (paidThisCycle && (!nextDue || nextDue >= todayYMD)) {
+    status = 'partial';
+    next_date = nextDue || dueNextMonth;
+  } else if (paidThisCycle && nextDue && nextDue < todayYMD) {
+    // A partial payment was made, but the promised top-up date has passed.
+    status = 'partial-overdue';
+    next_date = nextDue;
+  } else if (todayYMD <= dueDate) {
+    status = 'pending';
+    next_date = dueDate;
+  } else {
+    status = 'overdue';
+    next_date = nextDue || dueDate;
+  }
+
+  return { owed, status, next_date, due_date: dueDate, days_until: daysBetween(todayYMD, next_date) };
+}
+
+// Public shape of a recurring item for the API. CRITICAL (H1): the raw carried
+// debt from the sheet (`owed_base`, column F) and the computed accrued debt
+// (`owed`) are DIFFERENT numbers under DIFFERENT keys — undo needs the raw one.
+// `cycle` is echoed raw (the accrual anchor).
+function withStatus(rec, todayYMD) {
+  const { _row, ...pub } = rec;
+  return { ...pub, owed_base: rec.owed, ...computeRecurringStatus(rec, todayYMD) };
 }
 
 // === CONFIG (display timezone, single source of truth in KV) ===
@@ -325,6 +415,131 @@ async function getEvents(req, env) {
   if (limit) list = list.slice(-limit);
 
   return json({ count: list.length, events: list });
+}
+
+// === RECURRING PAYMENTS (GET list / POST pay / PATCH edit-undo) ===
+
+// GET /api/recurring — list every credit with its computed debt/status/next date.
+// Pure read: debt/status are computed virtually against the active zone's month,
+// the sheet is NOT rewritten (accrual persists only on a payment).
+async function getRecurring(env) {
+  const token = await getAccessToken(env);
+  const tz = await readTimezone(env);
+  const { items } = await readRecurring(env, token);
+  const ctx = zoneContext(null, tz);
+  const todayYMD = `${ctx.year}-${pad(ctx.month)}-${pad(ctx.day)}`;
+  return json({ items: items.map((it) => withStatus(it, todayYMD)), timezone: tz });
+}
+
+// POST /api/recurring/:id/pay — record a payment. Body:
+//   { amount?:number, full?:boolean, next_due?:'YYYY-MM-DD', at?:ISO }
+// `full:true` XOR a positive `amount`. Rolls the debt forward to the current
+// month (accrue), subtracts the payment, persists the row. Before writing it
+// snapshots the raw pre-state as `prev` so the front can undo exactly (H1).
+async function payRecurring(req, env, id) {
+  let body;
+  try { body = await req.json(); } catch { return error(400, 'invalid json'); }
+  if (!body || typeof body !== 'object') return error(400, 'invalid body');
+
+  const full = body.full === true;
+  const hasAmount = typeof body.amount === 'number' && isFinite(body.amount) && body.amount > 0;
+  if (full === hasAmount) return error(400, 'provide either full:true or a positive amount (not both)');
+  if (body.next_due !== undefined && body.next_due !== null && body.next_due !== '') {
+    if (typeof body.next_due !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.next_due)) {
+      return error(400, 'next_due must be YYYY-MM-DD');
+    }
+  }
+  if (body.at !== undefined && body.at !== null) {
+    if (typeof body.at !== 'string' || isNaN(new Date(body.at).getTime())) return error(400, 'at must be an ISO string');
+  }
+
+  const token = await getAccessToken(env);
+  const tz = await readTimezone(env);
+  const { items } = await readRecurring(env, token);
+  const item = items.find((it) => it.id === id);
+  if (!item) return error(404, `recurring not found: ${id}`);
+
+  const ctx = zoneContext(null, tz);
+  const curYM = `${ctx.year}-${pad(ctx.month)}`;
+  const todayYMD = `${ctx.year}-${pad(ctx.month)}-${pad(ctx.day)}`;
+
+  const acc = accrue(item, curYM);
+  const pay = full ? acc.owed : round2(body.amount);
+  const newOwed = round2(acc.owed - pay);
+
+  // Raw sheet values BEFORE the roll-forward — the front stores these and sends
+  // them back verbatim on undo. The raw owed_base is carried under the `owed` key
+  // (that's the PATCHABLE column that maps to owed_base), so patchRecurring accepts
+  // it as-is. Sending the computed owed instead would double the debt / freeze the
+  // cycle on a month edge.
+  const prev = { owed: item.owed, cycle: item.cycle, last_paid: item.last_paid, next_due: item.next_due };
+
+  const updated = {
+    ...item,
+    owed: newOwed,
+    cycle: curYM,
+    last_paid: body.at ? dateInZone(body.at, tz) : todayYMD,
+    next_due: newOwed > 0 ? (body.next_due || null) : null,
+  };
+
+  await writeRecurringRow(env, item._row, updated, token);
+
+  return ok({ item: withStatus(updated, todayYMD), prev });
+}
+
+// Fields a PATCH may change. `id` is immutable (the row's identity). `owed` here
+// is the RAW owed_base (column F), NOT the computed accrued debt — the undo path
+// sends the snapshotted raw values straight through.
+const RECURRING_PATCHABLE = ['name', 'amount', 'currency', 'due_day', 'owed', 'last_paid', 'next_due', 'cycle'];
+
+function validateRecurring(rec) {
+  if (!rec || typeof rec !== 'object') return { ok: false, message: 'invalid body' };
+  if (rec.amount != null && rec.amount !== '' && (typeof rec.amount !== 'number' || !isFinite(rec.amount) || rec.amount < 0)) {
+    return { ok: false, message: 'amount must be a non-negative number' };
+  }
+  if (rec.owed != null && rec.owed !== '' && (typeof rec.owed !== 'number' || !isFinite(rec.owed))) {
+    return { ok: false, message: 'owed must be a number' };
+  }
+  if (rec.due_day != null && rec.due_day !== '' && (typeof rec.due_day !== 'number' || !Number.isInteger(rec.due_day) || rec.due_day < 1 || rec.due_day > 31)) {
+    return { ok: false, message: 'due_day must be an integer 1..31' };
+  }
+  for (const f of ['last_paid', 'next_due']) {
+    const v = rec[f];
+    if (v != null && v !== '' && (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v))) {
+      return { ok: false, message: `${f} must be YYYY-MM-DD` };
+    }
+  }
+  if (rec.cycle != null && rec.cycle !== '' && (typeof rec.cycle !== 'string' || !/^\d{4}-\d{2}$/.test(rec.cycle))) {
+    return { ok: false, message: 'cycle must be YYYY-MM' };
+  }
+  return { ok: true };
+}
+
+// PATCH /api/recurring/:id — merge allowed fields over the stored row (direct
+// column edit; `owed` is the raw owed_base) and persist. Also the undo path: the
+// front sends the `prev` snapshot (owed_base→owed, cycle, last_paid, next_due).
+async function patchRecurring(req, env, id) {
+  let body;
+  try { body = await req.json(); } catch { return error(400, 'invalid json'); }
+  if (!body || typeof body !== 'object') return error(400, 'invalid body');
+
+  const token = await getAccessToken(env);
+  const tz = await readTimezone(env);
+  const { items } = await readRecurring(env, token);
+  const item = items.find((it) => it.id === id);
+  if (!item) return error(404, `recurring not found: ${id}`);
+
+  const merged = { ...item };
+  for (const k of RECURRING_PATCHABLE) if (k in body) merged[k] = body[k];
+
+  const v = validateRecurring(merged);
+  if (!v.ok) return error(400, v.message);
+
+  await writeRecurringRow(env, item._row, merged, token);
+
+  const ctx = zoneContext(null, tz);
+  const todayYMD = `${ctx.year}-${pad(ctx.month)}-${pad(ctx.day)}`;
+  return ok({ item: withStatus(merged, todayYMD) });
 }
 
 // === QUICK EXPENSE (POST /api/expense) — main screen of web app ===
@@ -876,6 +1091,54 @@ async function readEvents(env, token) {
     events.push(ev);
   }
   return events;
+}
+
+// Reads the Recurring sheet. Header is fixed at row 1 (like Events — NOT the
+// column-A scan readBalances needs for its floating header), so data starts at
+// row 2. Blank/incomplete rows (no id) are skipped; `_row` is the 1-based sheet
+// row for pin-point writes.
+async function readRecurring(env, token) {
+  token = token || await getAccessToken(env);
+  const rows = await sheetsValuesGet(env, `${RECURRING_SHEET}!A1:I`, token);
+  const items = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const id = r && r[0];
+    if (id == null || id === '') continue;
+    items.push(recurringRowToItem(r, i + 1));
+  }
+  return { items, dataStartRow: 2 };
+}
+
+function recurringRowToItem(r, rowNumber) {
+  const cell = (i) => (r[i] === undefined || r[i] === '' ? null : r[i]);
+  const num = (i) => { const v = cell(i); if (v == null) return null; return typeof v === 'number' ? v : parseFloat(v); };
+  return {
+    id: cell(0) != null ? String(cell(0)) : null,
+    name: cell(1) != null ? String(cell(1)) : '',
+    amount: num(2) || 0,
+    currency: cell(3) != null ? String(cell(3)) : '',
+    due_day: num(4) || 0,
+    owed: num(5) || 0,
+    last_paid: cell(6) != null ? String(cell(6)) : null,
+    next_due: cell(7) != null ? String(cell(7)) : null,
+    cycle: cell(8) != null ? String(cell(8)) : null,
+    _row: rowNumber,
+  };
+}
+
+// Overwrites one Recurring row (A:I) in place, RAW. Values follow RECURRING_COLS;
+// null/blank → '' (clean empty cell). Mirrors writeEventRow.
+async function writeRecurringRow(env, rowNumber, rec, token) {
+  const range = `${RECURRING_SHEET}!A${rowNumber}:I${rowNumber}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`;
+  const values = RECURRING_COLS.map((c) => { const v = rec[c]; return v == null ? '' : v; });
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: sheetsHeaders(token),
+    body: JSON.stringify({ values: [values] }),
+  });
+  if (!res.ok) throw new Error(`values.update ${range} ${res.status}: ${await res.text()}`);
 }
 
 function rowToEvent(r) {

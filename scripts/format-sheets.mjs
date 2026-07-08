@@ -15,6 +15,7 @@
 
 import {
   loadSA, spreadsheetId, getToken, valuesGet, getMeta, batchUpdate, die,
+  CURSYM, NODEC, numFmtCur,
 } from './_lib.mjs';
 
 const EVENTS = 'Events';
@@ -30,17 +31,8 @@ const INFO_BG = { red: 0.93, green: 0.95, blue: 0.97 };
 const GRID = { red: 0.75, green: 0.75, blue: 0.75 };
 const TIFFANY = { red: 0.039, green: 0.729, blue: 0.710 };       // #0abab5 — app accent, marks the primary account
 const TIFFANY_BG = { red: 0.82, green: 0.95, blue: 0.94 };       // light tint behind the SETTINGS value cells
-const NUMFMT = { type: 'NUMBER', pattern: '#,##0.00' }; // ru_RU: optional-decimal patterns dangle a separator
-// Per-currency number format: amount stays a number (API reads it unchanged),
-// the symbol is a display suffix. ₮ = Tether (USDT). Edit symbols here.
-const CURSYM = { RUB: '₽', THB: '฿', USDT: '₮', VND: '₫' };
-// Currencies with no minor unit — display without decimals (e.g. Vietnamese dong).
-const NODEC = new Set(['VND']);
-const numFmtCur = (c) => {
-  if (!CURSYM[c]) return NUMFMT;
-  const digits = NODEC.has(c) ? '#,##0' : '#,##0.00';
-  return { type: 'NUMBER', pattern: `${digits}" ${CURSYM[c]}"` };
-};
+// CURSYM/NODEC/numFmtCur (per-currency number format) live in _lib.mjs — shared
+// with create-recurring-sheet.mjs so the two never drift apart.
 const border = { style: 'SOLID', width: 1, color: GRID };
 
 const HEADER_FIELDS = 'userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)';

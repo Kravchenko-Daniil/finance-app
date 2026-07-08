@@ -98,3 +98,18 @@ export async function batchUpdate(token, id, requests) {
   if (!res.ok) die(`batchUpdate ${res.status}: ${await res.text()}`);
   return res.json();
 }
+
+// --- shared currency number-format table ---
+// Amount stays a plain number in the cell (the API reads/writes it unchanged);
+// the currency symbol is a cosmetic suffix baked into the number format pattern.
+// Single source of truth for every script that paints money columns
+// (format-sheets.mjs, create-recurring-sheet.mjs, …) — edit only here, both
+// import it, so the two never drift apart.
+export const CURSYM = { RUB: '₽', THB: '฿', USDT: '₮', VND: '₫' };
+// Currencies with no minor unit — display without decimals (e.g. Vietnamese dong).
+export const NODEC = new Set(['VND']);
+export function numFmtCur(c) {
+  if (!CURSYM[c]) return { type: 'NUMBER', pattern: '#,##0.00' }; // ru_RU: optional-decimal patterns dangle a separator
+  const digits = NODEC.has(c) ? '#,##0' : '#,##0.00';
+  return { type: 'NUMBER', pattern: `${digits}" ${CURSYM[c]}"` };
+}

@@ -71,9 +71,10 @@
       dayDate: AppConfig.today(), dayData: {},
       evType: 'expense', evFrom: null, evTo: null,
       evAmount: '', evAmount2: '', evNote: '', evDate: AppConfig.today(),
-      toast: null, toastUndoable: false,
+      toast: null, toastUndo: null,
       accounts: [], primary: null, balUpdatedAt: null, accountsLoaded: false,
       pendingUndoEventId: null,
+      recurring: [], recurringLoaded: false, paySheet: null, pendingRecurringUndo: null,
     };
     let raf = null, toastTimer = null, lastAccSig = '';
 
@@ -98,6 +99,7 @@
       events:   '<polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path>',
       balances: '<rect x="1" y="4" width="22" height="16" rx="2" ry="2"></rect><line x1="1" y1="10" x2="23" y2="10"></line>',
       day:      '<rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line>',
+      recurring:'<polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>',
       gear:     '<circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>',
       chevL:    '<polyline points="15 18 9 12 15 6"></polyline>',
       chevR:    '<polyline points="9 18 15 12 9 6"></polyline>',
@@ -120,6 +122,7 @@
                 ${navBtn('events', 'events')}
                 ${navBtn('balances', 'balances')}
                 ${navBtn('day', 'day')}
+                ${navBtn('recurring', 'recurring')}
               </div>
               <button id="nav-settings" style="display:flex;align-items:center;justify-content:center;width:32px;height:44px;background:none;border:none;cursor:pointer;padding:0;color:#f0f0f0;opacity:0.4;transition:transform .4s ${SPRING};">${svg('gear', 22)}</button>
             </div>
@@ -127,11 +130,12 @@
           </div>
         </div>
         <div id="toast-host"></div>
-        <div id="settings-host"></div>`;
+        <div id="settings-host"></div>
+        <div id="paysheet-host"></div>`;
 
       // press-эффекты нав-кнопок (тап → scale, у шестерёнки ещё поворот)
       pressFx(el('nav-settings'), 'scale(0.82) rotate(40deg)');
-      ['record', 'events', 'balances', 'day'].forEach((name) => {
+      ['record', 'events', 'balances', 'day', 'recurring'].forEach((name) => {
         const b = el('nav-' + name);
         pressFx(b, 'scale(0.78)');
         b.addEventListener('click', () => go(name));
@@ -152,7 +156,7 @@
     }
 
     function updateNav() {
-      ['record', 'events', 'balances', 'day'].forEach((name) => {
+      ['record', 'events', 'balances', 'day', 'recurring'].forEach((name) => {
         const b = el('nav-' + name);
         const active = state.screen === name;
         b.style.color = active ? ACC : '#f0f0f0';
@@ -166,6 +170,7 @@
       balances: `animation:screenIn .34s ${EASE_OUT};`,
       day:      `animation:screenIn .34s ${EASE_OUT};`,
       events:   `animation:screenIn .34s ${EASE_OUT};display:flex;flex-direction:column;gap:1.75rem;padding-bottom:1rem;`,
+      recurring:`animation:screenIn .34s ${EASE_OUT};display:flex;flex-direction:column;gap:1.25rem;`,
     };
 
     function go(name) {
@@ -187,6 +192,7 @@
       if (name === 'balances') { startCount(); loadBalances(); }
       else if (name === 'events') { if (!state.accountsLoaded) loadBalances(); }
       else if (name === 'day') { loadDay(state.dayDate); }
+      else if (name === 'recurring') loadRecurring();
     }
     // Ре-рендер только тела экрана (#screen сохраняется → screenIn НЕ повторяется,
     // но дочерние анимации rowIn/flyUp/shakeX проигрываются заново).
@@ -417,7 +423,7 @@
       else if (type === 'expense') ok = !!state.evFrom && amt !== null;
       else if (type === 'transfer') ok = !!state.evFrom && !!state.evTo && state.evFrom !== state.evTo && amt !== null;
       else if (type === 'exchange') ok = !!state.evFrom && !!state.evTo && state.evFrom !== state.evTo && amt !== null && amt2 !== null;
-      if (!ok) { showToast('Заполни счёт и сумму', { undoable: false }); return; }
+      if (!ok) { showToast('Заполни счёт и сумму'); return; }
 
       const payload = { type, amount: amt };
       if (type === 'income') payload.to = state.evTo;
@@ -433,7 +439,7 @@
         const res = await api('POST', '/api/event', payload);
         if (!res.ok) {
           let d = ''; try { d = (await res.json()).error || ''; } catch {}
-          showToast('Ошибка ' + res.status + (d ? ' · ' + d : ''), { undoable: false });
+          showToast('Ошибка ' + res.status + (d ? ' · ' + d : ''));
           return;
         }
         const data = await res.json();
@@ -441,24 +447,194 @@
         state.pendingUndoEventId = data.event && data.event.id ? data.event.id : null;
         state.evAmount = ''; state.evAmount2 = ''; state.evNote = '';
         renderBody();
-        showToast(eventSummary(data.event || payload), { undoable: !!state.pendingUndoEventId });
+        showToast(eventSummary(data.event || payload), state.pendingUndoEventId ? { undo: undoLast } : {});
       } catch {
-        showToast('Нет соединения', { undoable: false });
+        showToast('Нет соединения');
       }
     }
 
+    // ── RECURRING (регулярные платежи) ──────────────────────────────────
+    // Статус-иконка + цвет по статусу из GET /api/recurring. Помимо done/
+    // partial/pending/overdue есть partial-overdue — обещанная доплата просрочена.
+    const REC_STATUS = {
+      done:              { icon: '✓', color: '#5fd37e' },
+      partial:           { icon: '◐', color: ACC },
+      'partial-overdue': { icon: '◐', color: '#e87171' },
+      pending:           { icon: '○', color: 'rgba(240,240,240,0.7)' },
+      overdue:           { icon: '⚠', color: '#e87171' },
+    };
+    // Дата YYYY-MM-DD → «20 июля» (UTC-парс, только форматирование; вся
+    // календарная логика — на бэке).
+    function fmtDate(ymd) {
+      if (!ymd) return '';
+      const [y, m, d] = String(ymd).split('-').map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d));
+      return dt.toLocaleDateString('ru-RU', { timeZone: 'UTC', day: 'numeric', month: 'long' });
+    }
+    // Подпись следующей даты по статусу (next_date задан бэком во всех ветках).
+    function recSub(item) {
+      const owedStr = disp(item.owed, curSymbol(item.currency));
+      switch (item.status) {
+        case 'done':            return `дальше ${fmtDate(item.next_date)}`;
+        case 'partial':         return `осталось ${owedStr} · внесёшь ${fmtDate(item.next_date)}`;
+        case 'partial-overdue': return `осталось ${owedStr} · доплата просрочена с ${fmtDate(item.next_due)}`;
+        case 'pending':         return `до ${fmtDate(item.due_date)} · через ${item.days_until} дн.`;
+        case 'overdue':         return `просрочено с ${fmtDate(item.due_date)}`;
+        default:                return '';
+      }
+    }
+    BODY.recurring = () => {
+      const items = state.recurring || [];
+      let rows;
+      if (items.length === 0) {
+        rows = `<div style="opacity:0.3;padding:2rem 0;font-size:1.05rem;">${state.recurringLoaded ? 'нет платежей' : 'загрузка…'}</div>`;
+      } else {
+        rows = items.map((item, i) => {
+          const st = REC_STATUS[item.status] || REC_STATUS.pending;
+          const cur = curSymbol(item.currency);
+          return `<button data-id="${ea(item.id)}" style="display:flex;align-items:center;gap:0.9rem;width:100%;text-align:left;background:#111;border:1px solid #1c1c1c;border-radius:12px;padding:1rem 1.1rem;cursor:pointer;color:#f0f0f0;animation:rowIn .38s both ${EASE_OUT};animation-delay:${i * 55}ms;transition:transform .25s ${SPRING},border-color .2s;">
+            <span style="flex-shrink:0;display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;font-size:1rem;line-height:1;color:${st.color};border:1.5px solid ${st.color};">${st.icon}</span>
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:1.05rem;font-weight:600;letter-spacing:-0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(item.name || item.id)}</div>
+              <div style="opacity:0.45;font-size:0.78rem;margin-top:0.25rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(recSub(item))}</div>
+            </div>
+            <div style="flex-shrink:0;font-weight:600;font-size:1.35rem;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;color:${item.owed > 0 ? '#f0f0f0' : '#5fd37e'};">${disp(item.owed, cur)}</div>
+          </button>`;
+        }).join('');
+      }
+      return `<div class="lbl-h" style="margin-bottom:1.75rem;">Платежи</div>
+        <div style="display:flex;flex-direction:column;gap:0.7rem;">${rows}</div>`;
+    };
+    WIRE.recurring = () => {
+      document.querySelectorAll('#screen [data-id]').forEach((b) =>
+        b.addEventListener('click', () => openPaySheet(b.dataset.id)));
+    };
+    async function loadRecurring() {
+      if (!AppConfig.token()) { openSettings(); return; }
+      try {
+        const res = await api('GET', '/api/recurring');
+        if (!res.ok) return;
+        const data = await res.json();
+        AppConfig.cacheFrom(data); // синхронизировать зону с сервером
+        state.recurring = Array.isArray(data.items) ? data.items : [];
+        state.recurringLoaded = true;
+        if (state.screen === 'recurring') renderBody();
+      } catch {}
+    }
+
+    // ── Bottom-sheet оплаты (по образцу renderSettings, монтируется в #paysheet-host) ──
+    function openPaySheet(id) {
+      const item = (state.recurring || []).find((x) => x.id === id);
+      if (!item) return;
+      state.paySheet = { id, next_due: item.next_due || '', submitting: false };
+      renderPaySheet();
+    }
+    function closePaySheet() { state.paySheet = null; renderPaySheet(); }
+    function renderPaySheet() {
+      const host = el('paysheet-host');
+      if (!state.paySheet) { host.innerHTML = ''; return; }
+      const item = (state.recurring || []).find((x) => x.id === state.paySheet.id);
+      if (!item) { host.innerHTML = ''; return; }
+      const cur = curSymbol(item.currency);
+      host.innerHTML = `<div id="pay-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);display:flex;align-items:flex-end;justify-content:center;z-index:50;animation:fadeIn .2s ease;">
+        <div id="pay-sheet" style="width:100%;max-width:480px;background:#0e0e0e;border-top:1px solid #1f1f1f;border-radius:12px 12px 0 0;padding:1.75rem 1.6rem calc(env(safe-area-inset-bottom) + 1.6rem);animation:modalIn .32s cubic-bezier(0.34,1.4,0.64,1);">
+          <div class="lbl-h" style="margin-bottom:0.5rem;">${ea(item.name || item.id)}</div>
+          <div style="opacity:0.5;font-size:0.85rem;margin-bottom:1.75rem;">Долг ${disp(item.owed, cur)}</div>
+          <div style="margin-bottom:1.5rem;"><div class="lbl-f" style="margin-bottom:0.6rem;">Сумма взноса</div>
+            <div style="display:flex;align-items:baseline;gap:0.4rem;border-bottom:2px solid #262626;padding-bottom:0.5rem;">
+              <input id="pay-amount" placeholder="0" inputmode="decimal" autocomplete="off" style="flex:1;min-width:0;background:transparent;border:none;padding:0;font-size:2rem;font-weight:600;letter-spacing:-0.02em;color:#f0f0f0;font-variant-numeric:tabular-nums;">
+              <span style="opacity:0.4;font-size:1.1rem;">${cur}</span>
+            </div></div>
+          <div style="margin-bottom:1.75rem;"><div class="lbl-f" style="margin-bottom:0.5rem;">Дата следующего взноса</div>
+            <input id="pay-date" type="date" value="${ea(state.paySheet.next_due || '')}" style="width:100%;background:transparent;border:none;border-bottom:1px solid #262626;border-radius:0;padding:0.4rem 0 0.6rem;font-size:1.05rem;color:#f0f0f0;color-scheme:dark;"></div>
+          <button id="pay-submit" style="width:100%;background:${ACC};color:#0a0a0a;border:none;border-radius:4px;padding:1.2rem;font-size:1rem;font-weight:600;text-transform:uppercase;letter-spacing:0.02em;cursor:pointer;transition:transform .42s ${SPRING},box-shadow .3s,opacity .18s ease;margin-bottom:0.8rem;">Внести</button>
+          <button id="pay-full" style="width:100%;background:transparent;color:#f0f0f0;border:1px solid #262626;border-radius:4px;padding:1.1rem;font-size:0.95rem;font-weight:600;text-transform:uppercase;letter-spacing:0.02em;cursor:pointer;transition:transform .42s ${SPRING},opacity .18s ease;">Оплатил полностью</button>
+        </div></div>`;
+      el('pay-overlay').addEventListener('click', closePaySheet);
+      el('pay-sheet').addEventListener('click', (e) => e.stopPropagation());
+      const dt = el('pay-date');
+      dt.addEventListener('focus', () => { dt.style.borderBottomColor = ACC; });
+      dt.addEventListener('blur', () => { dt.style.borderBottomColor = '#262626'; });
+      dt.addEventListener('input', (e) => { state.paySheet.next_due = e.target.value; });
+      const submit = el('pay-submit');
+      submit.addEventListener('click', () => submitPay('amount'));
+      pressBtn(submit);
+      const full = el('pay-full');
+      full.addEventListener('click', () => submitPay('full'));
+      pressBtn(full, 'scale(0.96)');
+    }
+    // POST /api/recurring/:id/pay → {amount} или {full:true} (+ next_due, если
+    // остаётся долг и задана дата). Кнопки блокируются от двойного тапа.
+    async function submitPay(mode) {
+      const ps = state.paySheet;
+      if (!ps || ps.submitting) return;
+      const item = (state.recurring || []).find((x) => x.id === ps.id);
+      if (!item) return;
+      const sBtn = el('pay-submit'), fBtn = el('pay-full');
+      const setBusy = (busy) => [sBtn, fBtn].forEach((b) => { if (b) { b.disabled = busy; b.style.opacity = busy ? '0.5' : '1'; } });
+      let body;
+      if (mode === 'full') {
+        body = { full: true };
+      } else {
+        const amt = parseAmount(el('pay-amount').value);
+        if (amt === null) { showToast('Введи сумму'); return; }
+        body = { amount: amt };
+        const nd = (el('pay-date').value || '').trim();
+        if (nd && amt < Number(item.owed)) body.next_due = nd;
+      }
+      ps.submitting = true;
+      setBusy(true);
+      try {
+        const res = await api('POST', `/api/recurring/${encodeURIComponent(ps.id)}/pay`, body);
+        if (!res.ok) {
+          let d = ''; try { d = (await res.json()).error || ''; } catch {}
+          showToast('Ошибка ' + res.status + (d ? ' · ' + d : ''));
+          ps.submitting = false; setBusy(false);
+          return;
+        }
+        const data = await res.json();
+        state.pendingRecurringUndo = { id: ps.id, prev: data.prev || null };
+        const idx = state.recurring.findIndex((x) => x.id === ps.id);
+        if (idx >= 0 && data.item) state.recurring[idx] = data.item;
+        closePaySheet();
+        if (state.screen === 'recurring') renderBody();
+        showToast(recPaySummary(item, body), state.pendingRecurringUndo.prev ? { undo: undoRecurring } : {});
+        loadRecurring();
+      } catch {
+        showToast('Нет соединения');
+        ps.submitting = false; setBusy(false);
+      }
+    }
+    function recPaySummary(item, body) {
+      const nm = item.name || item.id;
+      if (body.full) return `${nm} · оплачено полностью`;
+      return `${nm} · внесено ${disp(body.amount, curSymbol(item.currency))}`;
+    }
+    // Undo оплаты: PATCH сырым prev из ответа pay (owed=owed_base, cycle,
+    // last_paid, next_due — НЕ вычисленный owed), затем перезагрузка.
+    async function undoRecurring() {
+      const u = state.pendingRecurringUndo;
+      if (!u || !u.prev) return;
+      try { await api('PATCH', `/api/recurring/${encodeURIComponent(u.id)}`, u.prev); } catch {}
+      state.pendingRecurringUndo = null;
+      loadRecurring();
+    }
+
     // ── TOAST ───────────────────────────────────────────────────────────
+    // Обобщён: showToast принимает opts.undo — колбэк отмены (undoLast для
+    // событий, undoRecurring для платежей). Кнопка «Отменить» зовёт его по
+    // контексту; без колбэка кнопки нет.
     function showToast(text, opts = {}) {
       if (toastTimer) clearTimeout(toastTimer);
       state.toast = text;
-      state.toastUndoable = !!opts.undoable;
+      state.toastUndo = typeof opts.undo === 'function' ? opts.undo : null;
       renderToast();
-      toastTimer = setTimeout(() => { state.toast = null; state.toastUndoable = false; renderToast(); }, 5000);
+      toastTimer = setTimeout(() => { state.toast = null; state.toastUndo = null; renderToast(); }, 5000);
     }
     function renderToast() {
       const host = el('toast-host');
       if (!state.toast) { host.innerHTML = ''; return; }
-      const undoBtn = state.toastUndoable
+      const undoBtn = state.toastUndo
         ? `<button id="toast-undo" style="flex-shrink:0;background:none;border:none;color:${ACC};font-weight:600;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.02em;cursor:pointer;padding:0.2rem 0.3rem;">Отменить</button>`
         : '';
       host.innerHTML = `<div style="position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 1.5rem);transform:translateX(-50%);width:calc(100% - 3.2rem);max-width:420px;background:#141414;border:1px solid #232323;border-radius:6px;box-shadow:0 12px 40px -10px rgba(0,0,0,0.8);animation:toastIn .4s ${SPRING};z-index:40;overflow:hidden;">
@@ -468,8 +644,14 @@
         </div>
         <div style="height:3px;background:${ACC};transform-origin:left;animation:barShrink 5s linear forwards;"></div>
       </div>`;
-      if (state.toastUndoable) {
-        el('toast-undo').addEventListener('click', () => { if (toastTimer) clearTimeout(toastTimer); undoLast(); state.toast = null; state.toastUndoable = false; renderToast(); });
+      if (state.toastUndo) {
+        el('toast-undo').addEventListener('click', () => {
+          if (toastTimer) clearTimeout(toastTimer);
+          const fn = state.toastUndo;
+          state.toast = null; state.toastUndo = null;
+          renderToast();
+          if (fn) fn();
+        });
       }
     }
 
