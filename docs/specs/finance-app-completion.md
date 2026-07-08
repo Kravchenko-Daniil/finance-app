@@ -50,7 +50,7 @@
   (primary_account), `readBalances`. Менять НЕ нужно для A1–A3; читать для понимания контракта.
 - `api/wrangler.toml` — `PRIMARY_ACCOUNT=bidv` (fallback; лист Settings приоритетнее).
 - `scripts/import-bidv.py` — готовый идемпотентный импорт выписки BIDV (D1), есть DRY_RUN.
-- `dev/notes/aggregator-design.md` §2 (снимок+поток), §12 (watchdog) — модель.
+- `docs/private/aggregator-design.md` §2 (снимок+поток), §12 (watchdog) — модель.
 - `CLAUDE.md` — отстаёт (log_only/hidden описаны как pending, а они в проде) — D2.
 
 ### New Files

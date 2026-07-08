@@ -37,8 +37,8 @@ Thumbs.db
 scripts/_backups/
 
 # Backstage: personal design notes + work-in-progress handoffs (real balances,
-# debts, account ids) — never commit. The whole dev/ tree is local-only.
-dev/
+# debts, account ids) — never commit. The whole docs/private/ tree is local-only.
+docs/private/
 
 # Contains BIDV statement password hardcoded — never commit as-is
 scripts/import-bidv.py
