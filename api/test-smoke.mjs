@@ -15,6 +15,9 @@ const TOKEN_CURRENCY = {
   vnd: 'VND', донг: 'VND',
 };
 
+const ACCOUNT_TOKEN_RE = /(?<![\p{L}\p{N}_])(нал|наличка|наличкой|наличные|наличными|cash|кэш)(?![\p{L}\p{N}_])/giu;
+const TOKEN_ACCOUNT = { нал:'cash', наличка:'cash', наличкой:'cash', наличные:'cash', наличными:'cash', cash:'cash', 'кэш':'cash' };
+
 function parseExpense(input) {
   let text = input.replace(/[\r\n]+/g, ' ').trim();
   if (!text) throw new Error('empty input');
@@ -27,6 +30,14 @@ function parseExpense(input) {
     text = text.replace(CURRENCY_TOKEN_RE, ' ').replace(/\s+/g, ' ').trim();
   }
 
+  let account = null;
+  const accTokens = [...text.matchAll(ACCOUNT_TOKEN_RE)];
+  if (accTokens.length === 1) {
+    const atok = accTokens[0][1].toLowerCase();
+    account = TOKEN_ACCOUNT[atok] || null;
+    text = text.replace(ACCOUNT_TOKEN_RE, ' ').replace(/\s+/g, ' ').trim();
+  }
+
   const matches = [...text.matchAll(/\d+/g)];
   if (matches.length === 0) throw new Error('no amount found');
   const last = matches[matches.length - 1];
@@ -37,7 +48,7 @@ function parseExpense(input) {
   let description = (before + ' ' + after).replace(/\s+/g, ' ').trim();
   description = description.replace(/[\s,;:.]+$/, '').replace(/^[\s,;:.]+/, '');
   if (!description) description = '—';
-  return { description, amount, currency };
+  return { description, amount, currency, account };
 }
 
 function zoneContext(nowISO, tz) {
@@ -211,32 +222,40 @@ function eq(actual, expected, label) {
 }
 
 console.log('\n=== parseExpense ===');
-eq(parseExpense('кофе 350'), { description: 'кофе', amount: 350, currency: null }, '"кофе 350" (no token → currency=null → routes to PRIMARY_ACCOUNT)');
-eq(parseExpense('350 кофе'), { description: 'кофе', amount: 350, currency: null }, '"350 кофе" (sum first, but desc captured)');
-eq(parseExpense('кофе 1300'), { description: 'кофе', amount: 1300, currency: null }, '"кофе 1300" (no space — write big numbers without space)');
-eq(parseExpense('Ресторан Мишлен на 2 530'), { description: 'Ресторан Мишлен на 2', amount: 530, currency: null }, '"Ресторан Мишлен на 2 530" (last number wins → 530)');
-eq(parseExpense('массаж 1300'), { description: 'массаж', amount: 1300, currency: null }, '"массаж 1300" (no space)');
-eq(parseExpense('  кофе   350  '), { description: 'кофе', amount: 350, currency: null }, 'trim+collapse spaces');
-eq(parseExpense('фитнес-зал на месяц 1800'), { description: 'фитнес-зал на месяц', amount: 1800, currency: null }, 'multi-word desc');
+eq(parseExpense('кофе 350'), { description: 'кофе', amount: 350, currency: null, account: null }, '"кофе 350" (no token → currency=null → routes to PRIMARY_ACCOUNT)');
+eq(parseExpense('350 кофе'), { description: 'кофе', amount: 350, currency: null, account: null }, '"350 кофе" (sum first, but desc captured)');
+eq(parseExpense('кофе 1300'), { description: 'кофе', amount: 1300, currency: null, account: null }, '"кофе 1300" (no space — write big numbers without space)');
+eq(parseExpense('Ресторан Мишлен на 2 530'), { description: 'Ресторан Мишлен на 2', amount: 530, currency: null, account: null }, '"Ресторан Мишлен на 2 530" (last number wins → 530)');
+eq(parseExpense('массаж 1300'), { description: 'массаж', amount: 1300, currency: null, account: null }, '"массаж 1300" (no space)');
+eq(parseExpense('  кофе   350  '), { description: 'кофе', amount: 350, currency: null, account: null }, 'trim+collapse spaces');
+eq(parseExpense('фитнес-зал на месяц 1800'), { description: 'фитнес-зал на месяц', amount: 1800, currency: null, account: null }, 'multi-word desc');
 try { parseExpense(''); console.log('  ✗ empty should throw'); fail++; } catch { console.log('  ✓ empty throws'); pass++; }
 try { parseExpense('кофе'); console.log('  ✗ no number should throw'); fail++; } catch { console.log('  ✓ "кофе" (no amount) throws'); pass++; }
 
 // Currency hint
-eq(parseExpense('перевод другу 26 usdt'), { description: 'перевод другу', amount: 26, currency: 'USDT' }, '"... 26 usdt" → USDT');
-eq(parseExpense('подписка 500 руб'), { description: 'подписка', amount: 500, currency: 'RUB' }, '"... 500 руб" → RUB');
-eq(parseExpense('steam 15 rub'), { description: 'steam', amount: 15, currency: 'RUB' }, '"... 15 rub" → RUB (latin)');
-eq(parseExpense('usdt 26'), { description: '—', amount: 26, currency: 'USDT' }, '"usdt 26" (token first, no desc → "—")');
-eq(parseExpense('платил usdt за хостинг 12'), { description: 'платил за хостинг', amount: 12, currency: 'USDT' }, 'token in the middle');
-eq(parseExpense('тест USDT 10'), { description: 'тест', amount: 10, currency: 'USDT' }, 'USDT uppercase');
-eq(parseExpense('тест Руб 100'), { description: 'тест', amount: 100, currency: 'RUB' }, '"Руб" capitalized');
-eq(parseExpense('рубероид на крышу 1500'), { description: 'рубероид на крышу', amount: 1500, currency: null }, '"рубероид" не матчит руб');
-eq(parseExpense('купил рубашку 800'), { description: 'купил рубашку', amount: 800, currency: null }, '"рубашку" не матчит руб');
-eq(parseExpense('обмен usdt в rub 100'), { description: 'обмен usdt в rub', amount: 100, currency: null }, 'два токена → ambiguous, currency=null');
-eq(parseExpense('фо бо 50 бат'), { description: 'фо бо', amount: 50, currency: 'THB' }, '"... 50 бат" → THB');
-eq(parseExpense('massage 200 baht'), { description: 'massage', amount: 200, currency: 'THB' }, '"... 200 baht" → THB (latin)');
-eq(parseExpense('такси 80000 донг'), { description: 'такси', amount: 80000, currency: 'VND' }, '"... 80000 донг" → VND');
-eq(parseExpense('обед 120000 vnd'), { description: 'обед', amount: 120000, currency: 'VND' }, '"... 120000 vnd" → VND (latin)');
-eq(parseExpense('купил батут 3000'), { description: 'купил батут', amount: 3000, currency: null }, '"батут" не матчит бат');
+eq(parseExpense('перевод другу 26 usdt'), { description: 'перевод другу', amount: 26, currency: 'USDT', account: null }, '"... 26 usdt" → USDT');
+eq(parseExpense('подписка 500 руб'), { description: 'подписка', amount: 500, currency: 'RUB', account: null }, '"... 500 руб" → RUB');
+eq(parseExpense('steam 15 rub'), { description: 'steam', amount: 15, currency: 'RUB', account: null }, '"... 15 rub" → RUB (latin)');
+eq(parseExpense('usdt 26'), { description: '—', amount: 26, currency: 'USDT', account: null }, '"usdt 26" (token first, no desc → "—")');
+eq(parseExpense('платил usdt за хостинг 12'), { description: 'платил за хостинг', amount: 12, currency: 'USDT', account: null }, 'token in the middle');
+eq(parseExpense('тест USDT 10'), { description: 'тест', amount: 10, currency: 'USDT', account: null }, 'USDT uppercase');
+eq(parseExpense('тест Руб 100'), { description: 'тест', amount: 100, currency: 'RUB', account: null }, '"Руб" capitalized');
+eq(parseExpense('рубероид на крышу 1500'), { description: 'рубероид на крышу', amount: 1500, currency: null, account: null }, '"рубероид" не матчит руб');
+eq(parseExpense('купил рубашку 800'), { description: 'купил рубашку', amount: 800, currency: null, account: null }, '"рубашку" не матчит руб');
+eq(parseExpense('обмен usdt в rub 100'), { description: 'обмен usdt в rub', amount: 100, currency: null, account: null }, 'два токена → ambiguous, currency=null');
+eq(parseExpense('фо бо 50 бат'), { description: 'фо бо', amount: 50, currency: 'THB', account: null }, '"... 50 бат" → THB');
+eq(parseExpense('massage 200 baht'), { description: 'massage', amount: 200, currency: 'THB', account: null }, '"... 200 baht" → THB (latin)');
+eq(parseExpense('такси 80000 донг'), { description: 'такси', amount: 80000, currency: 'VND', account: null }, '"... 80000 донг" → VND');
+eq(parseExpense('обед 120000 vnd'), { description: 'обед', amount: 120000, currency: 'VND', account: null }, '"... 120000 vnd" → VND (latin)');
+eq(parseExpense('купил батут 3000'), { description: 'купил батут', amount: 3000, currency: null, account: null }, '"батут" не матчит бат');
+
+// Account hint (names a specific account when several share a currency: cash vs truemoney)
+eq(parseExpense('такси 80 нал'), { description: 'такси', amount: 80, currency: null, account: 'cash' }, '"... 80 нал" → account=cash');
+eq(parseExpense('кофе 350'), { description: 'кофе', amount: 350, currency: null, account: null }, '"кофе 350" → account=null (нет токена)');
+eq(parseExpense('налог 500'), { description: 'налог', amount: 500, currency: null, account: null }, '"налог" не матчит нал (граница слова)');
+eq(parseExpense('обед 200 бат нал'), { description: 'обед', amount: 200, currency: 'THB', account: 'cash' }, '"... 200 бат нал" → currency=THB И account=cash');
+eq(parseExpense('нал 100 cash'), { description: 'нал cash', amount: 100, currency: null, account: null }, '"нал 100 cash" → два account-токена → account=null (токены не вырезаны, guard «ровно один»)');
+eq(parseExpense('кофе 350 cash'), { description: 'кофе', amount: 350, currency: null, account: 'cash' }, '"кофе 350 cash" → account=cash');
 
 console.log('\n=== zoneContext / dateInZone (parameterized timezone) ===');
 const TZ = 'Asia/Bangkok';

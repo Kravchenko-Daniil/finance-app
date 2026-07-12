@@ -129,6 +129,13 @@ const TOKEN_CURRENCY = {
   vnd: 'VND', донг: 'VND',
 };
 
+// Optional account-token: names a specific account when several share a currency
+// (e.g. cash vs truemoney, both THB). Same unicode word-boundary guard as the
+// currency token, so "налог" / substrings never match. Maps to an alias key that
+// handleQuickExpense resolves to a real account id via env (id not hardcoded).
+const ACCOUNT_TOKEN_RE = /(?<![\p{L}\p{N}_])(нал|наличка|наличкой|наличные|наличными|cash|кэш)(?![\p{L}\p{N}_])/giu;
+const TOKEN_ACCOUNT = { нал:'cash', наличка:'cash', наличкой:'cash', наличные:'cash', наличными:'cash', cash:'cash', 'кэш':'cash' };
+
 function defaultAccountByCurrency(env) {
   return {
     USDT: env.DEFAULT_ACCOUNT_USDT,
@@ -136,6 +143,11 @@ function defaultAccountByCurrency(env) {
     THB: env.DEFAULT_ACCOUNT_THB,
     VND: env.DEFAULT_ACCOUNT_VND,
   };
+}
+
+// Account-token alias → real account id, env-driven so ids stay in config.
+function accountAliasById(env) {
+  return { cash: env.ACCOUNT_ALIAS_CASH };
 }
 
 function parseExpense(input) {
@@ -150,6 +162,18 @@ function parseExpense(input) {
     text = text.replace(CURRENCY_TOKEN_RE, ' ').replace(/\s+/g, ' ').trim();
   }
 
+  // Account-token is parsed independently of the currency token — both are cut
+  // out before the amount is read, so "обед 200 бат нал" yields currency AND
+  // account. Same "exactly one token" guard as currency: two account-tokens are
+  // ambiguous and route nowhere (account stays null).
+  let account = null;
+  const accTokens = [...text.matchAll(ACCOUNT_TOKEN_RE)];
+  if (accTokens.length === 1) {
+    const atok = accTokens[0][1].toLowerCase();
+    account = TOKEN_ACCOUNT[atok] || null;
+    text = text.replace(ACCOUNT_TOKEN_RE, ' ').replace(/\s+/g, ' ').trim();
+  }
+
   const matches = [...text.matchAll(/\d+/g)];
   if (matches.length === 0) throw new Error('no amount found');
   const last = matches[matches.length - 1];
@@ -160,7 +184,7 @@ function parseExpense(input) {
   let description = (before + ' ' + after).replace(/\s+/g, ' ').trim();
   description = description.replace(/[\s,;:.]+$/, '').replace(/^[\s,;:.]+/, '');
   if (!description) description = '—';
-  return { description, amount, currency };
+  return { description, amount, currency, account };
 }
 
 // "Today" (and weekday/section header) in the given zone. `dateParam` builds the
@@ -552,11 +576,16 @@ async function handleQuickExpense(req, env) {
   let parsed;
   try { parsed = parseExpense(body.text); } catch (e) { return error(400, e.message); }
 
-  // No currency token → the everyday "primary" account, read from the Settings
-  // sheet (so the user switches it by editing a cell, no redeploy). A currency
-  // token routes to that currency's default account (env) instead.
+  // Resolve source account by specificity: an account-token (e.g. "нал"/"cash")
+  // is the most specific — it names one account when several share a currency, so
+  // it beats the currency default. A currency token routes to that currency's
+  // default account (env). No token → the everyday "primary" account, read from
+  // the Settings sheet (so the user switches it by editing a cell, no redeploy).
   let from;
-  if (parsed.currency) {
+  if (parsed.account) {
+    from = accountAliasById(env)[parsed.account];
+    if (!from) return error(500, `no account configured for alias ${parsed.account}`);
+  } else if (parsed.currency) {
     from = defaultAccountByCurrency(env)[parsed.currency];
     if (!from) return error(500, `no default account configured for currency ${parsed.currency}`);
   } else {
