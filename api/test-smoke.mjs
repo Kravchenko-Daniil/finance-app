@@ -467,132 +467,140 @@ applyDelete(a, dLO);
 eq(acc(a, 'bybit'), 1000, 'delete log_only expense: no reverse → bybit stays 1000');
 
 // === RECURRING pure logic (inline copies of src/index.js — keep in sync!) ===
+// Payday-bucket model: no debt accrual. Status is derived on read from today,
+// payday, paid-in-cycle, an optional deferral, and the lead window.
 
 const round2 = (x) => Math.round(x * 100) / 100;
-const monthIndex = (ym) => { const [y, m] = String(ym).split('-').map(Number); return y * 12 + (m - 1); };
-const monthsElapsed = (fromYM, toYM) => Math.max(0, monthIndex(toYM) - monthIndex(fromYM));
 const daysInMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
 const clampDay = (y, m, d) => Math.min(d, daysInMonth(y, m));
-const addMonthYM = (ym, k) => { const idx = monthIndex(ym) + k; return `${Math.floor(idx / 12)}-${pad((idx % 12) + 1)}`; };
 const ymdToUTC = (ymd) => { const [y, m, d] = String(ymd).split('-').map(Number); return Date.UTC(y, m - 1, d); };
 const daysBetween = (fromYMD, toYMD) => Math.round((ymdToUTC(toYMD) - ymdToUTC(fromYMD)) / 86400000);
+const addDaysYMD = (ymd, k) => {
+  const d = new Date(ymdToUTC(ymd) + k * 86400000);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+};
 
-function accrue(rec, curYM) {
-  if (!rec.cycle) return { owed: round2(rec.owed || 0), cycle: curYM, accrued: 0 };
-  const k = monthsElapsed(rec.cycle, curYM);
-  const accrued = round2((rec.amount || 0) * k);
-  return { owed: round2((rec.owed || 0) + accrued), cycle: curYM, accrued };
-}
-
-function computeRecurringStatus(rec, todayYMD) {
+function computeRecurringStatus(rec, todayYMD, lead) {
   const curYM = todayYMD.slice(0, 7);
   const [cy, cm] = curYM.split('-').map(Number);
-  const owed = accrue(rec, curYM).owed;
-  const dueDate = `${curYM}-${pad(clampDay(cy, cm, rec.due_day))}`;
-  const nextYM = addMonthYM(curYM, 1);
-  const [ny, nm] = nextYM.split('-').map(Number);
-  const dueNextMonth = `${nextYM}-${pad(clampDay(ny, nm, rec.due_day))}`;
-  const paidThisCycle = !!(rec.last_paid && String(rec.last_paid).slice(0, 7) === curYM);
-  const nextDue = rec.next_due || null;
+  const amount = rec.amount || 0;
+  const paid = round2(rec.cycle === curYM ? (rec.paid_amount || 0) : 0);
+  const remaining = round2(amount - paid);
+  const paydayDate = `${curYM}-${pad(clampDay(cy, cm, rec.payday))}`;
+  const due = rec.defer_to || paydayDate;
+  const leadDate = addDaysYMD(due, -(Number.isInteger(lead) ? lead : 3));
 
-  let status, next_date;
-  if (owed <= 0) {
-    status = 'done';
-    next_date = dueNextMonth;
-  } else if (paidThisCycle && (!nextDue || nextDue >= todayYMD)) {
-    status = 'partial';
-    next_date = nextDue || dueNextMonth;
-  } else if (paidThisCycle && nextDue && nextDue < todayYMD) {
-    status = 'partial-overdue';
-    next_date = nextDue;
-  } else if (todayYMD <= dueDate) {
-    status = 'pending';
-    next_date = dueDate;
-  } else {
-    status = 'overdue';
-    next_date = nextDue || dueDate;
-  }
-  return { owed, status, next_date, due_date: dueDate, days_until: daysBetween(todayYMD, next_date) };
+  let status;
+  if (paid >= amount) status = 'paid';
+  else if (paid > 0) status = 'partial';
+  else if (todayYMD < leadDate) status = 'upcoming';
+  else if (todayYMD <= due) status = 'due';
+  else status = 'overdue';
+
+  return { status, paid, remaining, due_date: due, days_until: daysBetween(todayYMD, due) };
 }
 
-console.log('\n=== recurring: month/day helpers ===');
-eq(monthIndex('2026-07'), 2026 * 12 + 6, 'monthIndex 2026-07');
-eq(monthsElapsed('2026-05', '2026-07'), 2, 'monthsElapsed 05→07 = 2');
-eq(monthsElapsed('2026-07', '2026-05'), 0, 'monthsElapsed backwards clamped to 0');
+console.log('\n=== recurring: day helpers ===');
 eq(daysInMonth(2026, 2), 28, 'Feb 2026 = 28 days');
 eq(daysInMonth(2028, 2), 29, 'Feb 2028 (leap) = 29 days');
 eq(clampDay(2026, 2, 31), 28, 'clampDay 31 in Feb 2026 → 28');
-eq(addMonthYM('2025-12', 1), '2026-01', '(k) Dec→Jan rolls year with leading zero'); // case k
-eq(addMonthYM('2026-01', 1), '2026-02', 'addMonthYM Jan→Feb');
-eq(addMonthYM('2026-07', 5), '2026-12', 'addMonthYM +5 → Dec');
+eq(daysBetween('2026-07-18', '2026-07-20'), 2, 'daysBetween 18→20 = 2');
+eq(addDaysYMD('2026-07-20', -3), '2026-07-17', 'addDaysYMD -3 → lead date');
+eq(addDaysYMD('2026-03-01', -3), '2026-02-26', 'addDaysYMD crosses month boundary');
+eq(addDaysYMD('2026-01-01', -1), '2025-12-31', 'addDaysYMD crosses year boundary');
 
-console.log('\n=== recurring: accrue (lazy carry-over, model Б) ===');
-// (g) empty cycle → safe fallback, no accrual, owed = OWED as-is
-eq(accrue({ owed: 15000, amount: 15000, cycle: '' }, '2026-07').owed, 15000, '(g) empty cycle → no accrual, owed=OWED');
-eq(accrue({ owed: 15000, amount: 15000, cycle: '' }, '2026-07').accrued, 0, '(g) empty cycle → accrued 0');
-// (h) model Б: never paid, cycle filled, 3 months elapsed → owed grows by amount*3
-eq(accrue({ owed: 15000, amount: 15000, cycle: '2026-04' }, '2026-07').owed, 60000, '(h) never paid, cycle set, +3mo → 15000+15000*3');
-// (b) partial carry-over: owed_base 7000, prev cycle, amount 15000 → 22000
-eq(accrue({ owed: 7000, amount: 15000, cycle: '2026-06' }, '2026-07').owed, 22000, '(b) carry 7000 + norm 15000 → 22000');
-// (l) double pay in same month does not re-accrue: same curYM, k=0
-eq(accrue({ owed: 5000, amount: 15000, cycle: '2026-07' }, '2026-07').accrued, 0, '(l) same-month pay → no extra accrual');
-eq(accrue({ owed: 5000, amount: 15000, cycle: '2026-07' }, '2026-07').owed, 5000, '(l) same-month base unchanged (owed=owed_base)');
+console.log('\n=== recurring: computeRecurringStatus (payday buckets, lead=3) ===');
+const L = 3;
+// paid == norm → paid
+const sPaid = computeRecurringStatus({ amount: 15500, payday: 5, paid_amount: 15500, cycle: '2026-07', defer_to: null }, '2026-07-06', L);
+eq(sPaid.status, 'paid', 'paid: paid_amount == amount → paid');
+eq(sPaid.paid, 15500, 'paid: paid = 15500');
+eq(sPaid.remaining, 0, 'paid: remaining 0');
+// overpayment → paid
+eq(computeRecurringStatus({ amount: 15500, payday: 5, paid_amount: 16000, cycle: '2026-07', defer_to: null }, '2026-07-06', L).status, 'paid', 'overpayment (paid>amount) → paid');
+// partial: 0 < paid < norm (ВТБ 40000 из 67523 → remaining 27523)
+const sPart = computeRecurringStatus({ amount: 67523, payday: 20, paid_amount: 40000, cycle: '2026-07', defer_to: null }, '2026-07-18', L);
+eq(sPart.status, 'partial', 'partial: 0<paid<amount → partial');
+eq(sPart.remaining, 27523, 'partial: remaining = 67523-40000 = 27523');
+eq(sPart.paid, 40000, 'partial: paid = 40000');
+// upcoming: paid 0, today strictly before (due - lead). payday 20, today 16, lead 3 → leadDate 17 → 16<17 upcoming
+const sUp = computeRecurringStatus({ amount: 67523, payday: 20, paid_amount: 0, cycle: null, defer_to: null }, '2026-07-16', L);
+eq(sUp.status, 'upcoming', 'upcoming: today 16 < leadDate 17');
+eq(sUp.due_date, '2026-07-20', 'upcoming: due_date = payday date');
+eq(sUp.days_until, 4, 'upcoming: days_until 20-16 = 4');
+// due: paid 0, leadDate <= today <= due. today 18, payday 20, lead 3 → leadDate 17 → 17<=18<=20 due (Даниил сел 18-го)
+const sDue = computeRecurringStatus({ amount: 67523, payday: 20, paid_amount: 0, cycle: null, defer_to: null }, '2026-07-18', L);
+eq(sDue.status, 'due', 'due: 18-го бакет 20-го активен (lead 3)');
+eq(sDue.days_until, 2, 'due: days_until 20-18 = 2');
+// due edge: today == leadDate exactly
+eq(computeRecurringStatus({ amount: 100, payday: 20, paid_amount: 0, cycle: null, defer_to: null }, '2026-07-17', L).status, 'due', 'due: today == leadDate (boundary inclusive)');
+// due edge: today == due exactly
+eq(computeRecurringStatus({ amount: 100, payday: 20, paid_amount: 0, cycle: null, defer_to: null }, '2026-07-20', L).status, 'due', 'due: today == due (boundary inclusive)');
+// overdue: paid 0, today > due. payday 5, today 20 → overdue
+const sOver = computeRecurringStatus({ amount: 15500, payday: 5, paid_amount: 0, cycle: null, defer_to: null }, '2026-07-20', L);
+eq(sOver.status, 'overdue', 'overdue: today 20 > payday-date 5');
+eq(sOver.days_until, -15, 'overdue: days_until 5-20 = -15 (negative)');
 
-console.log('\n=== recurring: computeRecurringStatus ===');
-// (a) fully paid this month → done, next = due_day of next month
-const sa = computeRecurringStatus({ owed: 0, amount: 15000, due_day: 15, cycle: '2026-07', last_paid: '2026-07-15', next_due: null }, '2026-07-20');
-eq(sa.status, 'done', '(a) owed 0 → done');
-eq(sa.next_date, '2026-08-15', '(a) next = due_day of next month');
-eq(sa.days_until > 0, true, '(a) done: days_until positive (future)');
-// (f) overpayment (owed<=0) → done
-eq(computeRecurringStatus({ owed: -500, amount: 15000, due_day: 10, cycle: '2026-07', last_paid: '2026-07-05', next_due: null }, '2026-07-20').status, 'done', '(f) owed<0 → done');
-// (c) never paid, today <= dueDate → pending, positive days_until
-const sc = computeRecurringStatus({ owed: 15000, amount: 15000, due_day: 25, cycle: '2026-07', last_paid: null, next_due: null }, '2026-07-10');
-eq(sc.status, 'pending', '(c) today<=due → pending');
-eq(sc.next_date, '2026-07-25', '(c) next_date = dueDate');
-eq(sc.days_until, 15, '(c) days_until = 15 (positive)');
-// (d) never paid, today > dueDate → overdue, days_until <= 0
-const sd = computeRecurringStatus({ owed: 15000, amount: 15000, due_day: 5, cycle: '2026-07', last_paid: null, next_due: null }, '2026-07-20');
-eq(sd.status, 'overdue', '(d) today>due → overdue');
-eq(sd.next_date, '2026-07-05', '(d) next_date = dueDate (no next_due)');
-eq(sd.days_until <= 0, true, '(d) overdue: days_until <= 0');
-// partial: paid this cycle, owed remains, next_due in the future
-const sp = computeRecurringStatus({ owed: 7000, amount: 15000, due_day: 5, cycle: '2026-07', last_paid: '2026-07-05', next_due: '2026-07-25' }, '2026-07-20');
-eq(sp.status, 'partial', 'partial: paid + remaining + future next_due');
-eq(sp.next_date, '2026-07-25', 'partial next_date = next_due');
-eq(sp.days_until, 5, 'partial days_until = 5');
-// partial with no next_due → next_date = due_day next month
-eq(computeRecurringStatus({ owed: 7000, amount: 15000, due_day: 5, cycle: '2026-07', last_paid: '2026-07-05', next_due: null }, '2026-07-20').next_date, '2026-08-05', 'partial no next_due → next month due_day');
-// (i) partial-overdue: paid this cycle, next_due already passed
-const si = computeRecurringStatus({ owed: 7000, amount: 15000, due_day: 5, cycle: '2026-07', last_paid: '2026-07-03', next_due: '2026-07-10' }, '2026-07-20');
-eq(si.status, 'partial-overdue', '(i) paid + next_due<today → partial-overdue (not partial)');
-eq(si.next_date, '2026-07-10', '(i) next_date = next_due');
-eq(si.days_until <= 0, true, '(i) partial-overdue days_until <= 0');
-// (e) clampDay: due_day=31 in a February month (done branch, next month Feb)
-eq(computeRecurringStatus({ owed: 0, amount: 15000, due_day: 31, cycle: '2026-01', last_paid: '2026-01-31', next_due: null }, '2026-01-20').next_date, '2026-02-28', '(e) done next=due_day 31 → clamp Feb 28');
-// (j) clampDay of NEXT month specifically (not current): due_day=31, curYM=2026-01, done → 2026-02-28, NOT 2026-02-31
-const sj = computeRecurringStatus({ owed: 0, amount: 15000, due_day: 31, cycle: '2026-01', last_paid: '2026-01-15', next_due: null }, '2026-01-15');
-eq(sj.next_date, '2026-02-28', '(j) next-month clamp: 2026-02-28 not 2026-02-31');
-eq(/^\d{4}-\d{2}-\d{2}$/.test(sj.next_date), true, '(j) next_date is a real YYYY-MM-DD');
-// leap-year variant: due_day=31, curYM=2028-01 → 2028-02-29
-eq(computeRecurringStatus({ owed: 0, amount: 15000, due_day: 31, cycle: '2028-01', last_paid: '2028-01-10', next_due: null }, '2028-01-10').next_date, '2028-02-29', '(j) leap: next month Feb 29');
-// pending with due_day=31 in a short month (current month clamp): April due_day 31 → 2026-04-30
-eq(computeRecurringStatus({ owed: 15000, amount: 15000, due_day: 31, cycle: '2026-04', last_paid: null, next_due: null }, '2026-04-10').next_date, '2026-04-30', 'pending: due_day 31 in April → clamp 30');
+console.log('\n=== recurring: cycle flip zeroes paid ===');
+// paid_amount stored but cycle is a PRIOR month → paid counts as 0 (new cycle).
+// payday 5, today 2026-08-06, lead 3 → leadDate 08-02, today 06 > due 05 → overdue on 0 paid
+const sFlip = computeRecurringStatus({ amount: 15500, payday: 5, paid_amount: 15500, cycle: '2026-07', defer_to: null }, '2026-08-06', L);
+eq(sFlip.paid, 0, 'cycle flip: prior-month paid_amount → paid 0');
+eq(sFlip.remaining, 15500, 'cycle flip: full norm remains');
+eq(sFlip.status, 'overdue', 'cycle flip: unpaid new cycle past payday → overdue');
+// same paid_amount but cycle == current month → counts
+eq(computeRecurringStatus({ amount: 15500, payday: 5, paid_amount: 15500, cycle: '2026-08', defer_to: null }, '2026-08-06', L).status, 'paid', 'same cycle current month → paid');
 
-// (m) next_date defined (no NaN days_until) in ALL five branches
-console.log('\n=== recurring: (m) next_date defined in all branches ===');
-const branchCases = [
-  ['done',            { owed: 0,     amount: 15000, due_day: 15, cycle: '2026-07', last_paid: '2026-07-15', next_due: null },        '2026-07-20'],
-  ['partial',         { owed: 7000,  amount: 15000, due_day: 5,  cycle: '2026-07', last_paid: '2026-07-05', next_due: '2026-07-25' }, '2026-07-20'],
-  ['partial-overdue', { owed: 7000,  amount: 15000, due_day: 5,  cycle: '2026-07', last_paid: '2026-07-03', next_due: '2026-07-10' }, '2026-07-20'],
-  ['pending',         { owed: 15000, amount: 15000, due_day: 25, cycle: '2026-07', last_paid: null,        next_due: null },        '2026-07-10'],
-  ['overdue',         { owed: 15000, amount: 15000, due_day: 5,  cycle: '2026-07', last_paid: null,        next_due: null },        '2026-07-20'],
+console.log('\n=== recurring: defer_to moves the due date ===');
+// deferred to 2026-08-05, viewing 2026-07-25 → due tracks defer_to, not payday 20.
+// leadDate 08-02, today 07-25 < 08-02 → upcoming (not overdue). Closes spec case 3.
+const sDefer = computeRecurringStatus({ amount: 67523, payday: 20, paid_amount: 0, cycle: null, defer_to: '2026-08-05' }, '2026-07-25', L);
+eq(sDefer.due_date, '2026-08-05', 'defer: due_date follows defer_to');
+eq(sDefer.status, 'upcoming', 'defer: moved out → not overdue while before lead window');
+eq(sDefer.days_until, 11, 'defer: days_until = 2026-08-05 - 2026-07-25 = 11');
+// deferred date reached within lead window → due
+eq(computeRecurringStatus({ amount: 67523, payday: 20, paid_amount: 0, cycle: null, defer_to: '2026-08-05' }, '2026-08-03', L).status, 'due', 'defer: inside lead window of deferred date → due');
+// clampDay: payday 31 in a short month (April) → due_date 2026-04-30
+eq(computeRecurringStatus({ amount: 100, payday: 31, paid_amount: 0, cycle: null, defer_to: null }, '2026-04-10', L).due_date, '2026-04-30', 'clampDay: payday 31 in April → 2026-04-30');
+
+console.log('\n=== recurring: pay math (partial += / full / cycle reset) ===');
+// Inline copy of payRecurring's cycle-aware paid math + full-cover deferral clear.
+function payMath(item, body, curYM) {
+  const full = body.full === true;
+  const paidInCycle = item.cycle === curYM ? (item.paid_amount || 0) : 0;
+  const amount = item.amount || 0;
+  const newPaid = full ? amount : round2(paidInCycle + body.amount);
+  return { paid_amount: newPaid, cycle: curYM, defer_to: newPaid >= amount ? null : item.defer_to };
+}
+// partial, same cycle → accumulate
+eq(payMath({ amount: 67523, paid_amount: 40000, cycle: '2026-07', defer_to: null }, { amount: 20000 }, '2026-07').paid_amount, 60000, 'partial same cycle: 40000 += 20000 = 60000');
+// partial, prior cycle → reset then set
+eq(payMath({ amount: 67523, paid_amount: 40000, cycle: '2026-06', defer_to: null }, { amount: 20000 }, '2026-07').paid_amount, 20000, 'partial cycle flip: prior paid dropped → 20000');
+eq(payMath({ amount: 67523, paid_amount: 40000, cycle: '2026-06', defer_to: null }, { amount: 20000 }, '2026-07').cycle, '2026-07', 'partial cycle flip: cycle set to current');
+// full → paid_amount = amount, cycle current
+eq(payMath({ amount: 15500, paid_amount: 0, cycle: '2026-06', defer_to: null }, { full: true }, '2026-07').paid_amount, 15500, 'full: paid_amount = amount');
+// full covering norm clears an active deferral
+eq(payMath({ amount: 67523, paid_amount: 0, cycle: '2026-07', defer_to: '2026-08-05' }, { full: true }, '2026-07').defer_to, null, 'full-cover clears defer_to');
+// partial that reaches the norm also clears deferral
+eq(payMath({ amount: 67523, paid_amount: 60000, cycle: '2026-07', defer_to: '2026-08-05' }, { amount: 7523 }, '2026-07').defer_to, null, 'partial reaching norm clears defer_to');
+// partial below norm keeps deferral
+eq(payMath({ amount: 67523, paid_amount: 0, cycle: '2026-07', defer_to: '2026-08-05' }, { amount: 10000 }, '2026-07').defer_to, '2026-08-05', 'partial below norm keeps defer_to');
+
+console.log('\n=== recurring: status set is exactly {upcoming,due,paid,partial,overdue} ===');
+const statusCases = [
+  ['upcoming', { amount: 100, payday: 20, paid_amount: 0,   cycle: null,      defer_to: null }, '2026-07-10'],
+  ['due',      { amount: 100, payday: 20, paid_amount: 0,   cycle: null,      defer_to: null }, '2026-07-18'],
+  ['paid',     { amount: 100, payday: 5,  paid_amount: 100, cycle: '2026-07', defer_to: null }, '2026-07-06'],
+  ['partial',  { amount: 100, payday: 5,  paid_amount: 40,  cycle: '2026-07', defer_to: null }, '2026-07-06'],
+  ['overdue',  { amount: 100, payday: 5,  paid_amount: 0,   cycle: null,      defer_to: null }, '2026-07-20'],
 ];
-for (const [expected, rec, today] of branchCases) {
-  const s = computeRecurringStatus(rec, today);
-  eq(s.status, expected, `(m) status = ${expected}`);
-  eq(typeof s.next_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.next_date), true, `(m) ${expected}: next_date is YYYY-MM-DD`);
-  eq(Number.isNaN(s.days_until), false, `(m) ${expected}: days_until is not NaN`);
+const allowed = new Set(['upcoming', 'due', 'paid', 'partial', 'overdue']);
+for (const [expected, rec, today] of statusCases) {
+  const s = computeRecurringStatus(rec, today, L);
+  eq(s.status, expected, `status = ${expected}`);
+  eq(allowed.has(s.status), true, `${expected}: in allowed set`);
+  eq(/^\d{4}-\d{2}-\d{2}$/.test(s.due_date), true, `${expected}: due_date is YYYY-MM-DD`);
+  eq(Number.isNaN(s.days_until), false, `${expected}: days_until is not NaN`);
 }
 
 console.log(`\n=== ${pass} pass, ${fail} fail ===`);

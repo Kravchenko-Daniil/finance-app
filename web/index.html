@@ -75,6 +75,7 @@
       accounts: [], primary: null, balUpdatedAt: null, accountsLoaded: false,
       pendingUndoEventId: null,
       recurring: [], recurringLoaded: false, paySheet: null, pendingRecurringUndo: null,
+      recToday: null, recLead: 3, recExpanded: null,
     };
     let raf = null, toastTimer = null, lastAccSig = '';
 
@@ -453,77 +454,158 @@
       }
     }
 
-    // ── RECURRING (регулярные платежи) ──────────────────────────────────
+    // ── RECURRING (payday-бакеты) ───────────────────────────────────────
     // Кастомный SVG-набор статус-иконок по статусу из GET /api/recurring. Единый
     // язык: кольцо-оправа r=9.25 + внутренний знак, штрих 1.75, viewBox 24, ровный
-    // baseline. Заливка = насколько погашено (диск+галка / нижний полукруг), часы =
-    // ждёт срока, восклицание = просрочено. Помимо done/partial/pending/overdue
-    // есть partial-overdue — обещанная доплата просрочена.
+    // baseline. Ровно пять состояний payday-модели, каждое отличимо с одного
+    // взгляда: upcoming — часы (ждёт окна), due — залитая точка (активен сейчас),
+    // paid — диск+галка (внёс норму), partial — нижний полукруг (внёс часть),
+    // overdue — восклицание (пропущен срок).
     const REC_COLOR = {
-      done: '#5fd37e', partial: ACC, 'partial-overdue': '#e87171',
-      pending: '#8b9196', overdue: '#e87171',
+      upcoming: '#8b9196', due: ACC, paid: '#5fd37e', partial: ACC, overdue: '#e87171',
     };
     function recIcon(status, px) {
-      const c = REC_COLOR[status] || REC_COLOR.pending;
+      const c = REC_COLOR[status] || REC_COLOR.upcoming;
       const ring = `<circle cx="12" cy="12" r="9.25" fill="none" stroke="${c}" stroke-width="1.75"/>`;
       let disc = '', mark = '';
-      if (status === 'done') {
+      if (status === 'paid') {
         disc = `<circle cx="12" cy="12" r="9.25" fill="${c}" fill-opacity="0.14"/>`;
         mark = `<path d="M7.9 12.4 l2.7 2.7 L16.3 8.9" fill="none" stroke="${c}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>`;
-      } else if (status === 'partial' || status === 'partial-overdue') {
+      } else if (status === 'partial') {
         disc = `<path d="M2.75 12 A9.25 9.25 0 0 0 21.25 12 Z" fill="${c}" fill-opacity="0.9"/>`;
         mark = `<line x1="2.75" y1="12" x2="21.25" y2="12" stroke="${c}" stroke-width="1.75" stroke-linecap="round"/>`;
-      } else if (status === 'pending') {
-        mark = `<path d="M12 12 V7.3 M12 12 L15.3 13.5" fill="none" stroke="${c}" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="1.15" fill="${c}"/>`;
+      } else if (status === 'due') {
+        disc = `<circle cx="12" cy="12" r="9.25" fill="${c}" fill-opacity="0.12"/>`;
+        mark = `<circle cx="12" cy="12" r="3.6" fill="${c}"/>`;
       } else if (status === 'overdue') {
         disc = `<circle cx="12" cy="12" r="9.25" fill="${c}" fill-opacity="0.1"/>`;
         mark = `<line x1="12" y1="6.9" x2="12" y2="12.9" stroke="${c}" stroke-width="1.9" stroke-linecap="round"/><circle cx="12" cy="16" r="1.05" fill="${c}"/>`;
+      } else { // upcoming — часы
+        mark = `<path d="M12 12 V7.3 M12 12 L15.3 13.5" fill="none" stroke="${c}" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="1.15" fill="${c}"/>`;
       }
       const s = px || 30;
       return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" style="flex-shrink:0;display:block;">${disc}${ring}${mark}</svg>`;
     }
     // Дата YYYY-MM-DD → «20 июля» (UTC-парс, только форматирование; вся
-    // календарная логика — на бэке).
+    // календарная логика статусов — на бэке).
     function fmtDate(ymd) {
       if (!ymd) return '';
       const [y, m, d] = String(ymd).split('-').map(Number);
       const dt = new Date(Date.UTC(y, m - 1, d));
       return dt.toLocaleDateString('ru-RU', { timeZone: 'UTC', day: 'numeric', month: 'long' });
     }
-    // Подпись следующей даты по статусу (next_date задан бэком во всех ветках).
+    // Ближайшее наступление payday (5/20) от today. strict=false → включая сам
+    // today (для «сколько дней до бакета»); strict=true → строго в будущем (для
+    // даты переноса). Число клампится к длине месяца. Только для группировки/
+    // переноса на фронте — статусы по-прежнему считает бэк.
+    const _pad2 = (x) => String(x).padStart(2, '0');
+    const _domClamp = (y, m, day) => Math.min(day, new Date(Date.UTC(y, m, 0)).getUTCDate());
+    function nextPaydayYMD(todayYMD, payday, strict) {
+      const [y, m, d] = String(todayYMD).split('-').map(Number);
+      const dThis = _domClamp(y, m, payday);
+      const hitThis = strict ? d < dThis : d <= dThis;
+      if (hitThis) return `${y}-${_pad2(m)}-${_pad2(dThis)}`;
+      let ny = y, nm = m + 1; if (nm > 12) { nm = 1; ny += 1; }
+      return `${ny}-${_pad2(nm)}-${_pad2(_domClamp(ny, nm, payday))}`;
+    }
+    function daysBetweenYMD(aYMD, bYMD) {
+      const [ay, am, ad] = String(aYMD).split('-').map(Number);
+      const [by, bm, bd] = String(bYMD).split('-').map(Number);
+      return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000);
+    }
+    // Подпись под именем платежа по статусу payday-модели. Никаких owed —
+    // тело кредита в этом экране не ведём (правило 8 CLAUDE.md).
     function recSub(item) {
-      const owedStr = disp(item.owed, curSymbol(item.currency));
+      const cur = curSymbol(item.currency);
       switch (item.status) {
-        case 'done':            return `дальше ${fmtDate(item.next_date)}`;
-        case 'partial':         return `осталось ${owedStr} · внесёшь ${fmtDate(item.next_date)}`;
-        case 'partial-overdue': return `осталось ${owedStr} · доплата просрочена с ${fmtDate(item.next_due)}`;
-        case 'pending':         return `до ${fmtDate(item.due_date)} · через ${item.days_until} дн.`;
-        case 'overdue':         return `просрочено с ${fmtDate(item.due_date)}`;
-        default:                return '';
+        case 'paid':     return 'внесено';
+        case 'partial':  return `осталось ${disp(item.remaining, cur)}`;
+        case 'due':      return `оплатить до ${fmtDate(item.due_date)}`;
+        case 'upcoming': return item.days_until != null
+                                  ? `${fmtDate(item.due_date)} · через ${item.days_until} дн.`
+                                  : `к ${fmtDate(item.due_date)}`;
+        case 'overdue':  return `просрочено с ${fmtDate(item.due_date)}`;
+        default:         return '';
       }
+    }
+    // Одна карточка платежа (общая для бакетов и секции «Просрочено»).
+    function recRow(item, i) {
+      const cur = curSymbol(item.currency);
+      const amtColor = item.status === 'paid' ? '#5fd37e' : '#f0f0f0';
+      return `<button data-id="${ea(item.id)}" style="display:flex;align-items:center;gap:0.9rem;width:100%;text-align:left;background:#111;border:1px solid #1c1c1c;border-radius:12px;padding:1rem 1.1rem;cursor:pointer;color:#f0f0f0;animation:rowIn .38s both ${EASE_OUT};animation-delay:${i * 55}ms;transition:transform .25s ${SPRING},border-color .2s;">
+        ${recIcon(item.status, 30)}
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:1.05rem;font-weight:600;letter-spacing:-0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(item.name || item.id)}</div>
+          <div style="opacity:0.45;font-size:0.78rem;margin-top:0.25rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(recSub(item))}</div>
+        </div>
+        <div style="flex-shrink:0;font-weight:600;font-size:1.35rem;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;color:${amtColor};">${disp(item.amount, cur)}</div>
+      </button>`;
+    }
+    // Секция «Просрочено» — всегда наверху и раскрыта, когда есть overdue.
+    function recOverdueSection(list) {
+      const rows = list.map((item, i) => recRow(item, i)).join('');
+      return `<div style="margin-bottom:0.4rem;">
+        <div style="display:flex;align-items:baseline;gap:0.6rem;margin-bottom:0.75rem;">
+          <span style="text-transform:uppercase;letter-spacing:0.12em;font-size:0.7rem;font-weight:600;color:#e87171;">Просрочено</span>
+          <span style="opacity:0.4;font-size:0.72rem;">${list.length}</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:0.7rem;">${rows}</div>
+      </div>`;
+    }
+    // Бакет одного payday: заголовок-переключатель (тап сворачивает/разворачивает)
+    // + список карточек, когда раскрыт. Ближайший по времени бакет открыт по
+    // умолчанию (см. BODY.recurring), дальний свёрнут.
+    function recBucketSection(payday, bucket, expanded, days) {
+      const when = days === 0 ? 'сегодня' : `через ${days} дн.`;
+      const header = `<button data-bucket="${payday}" style="display:flex;align-items:center;justify-content:space-between;width:100%;background:none;border:none;padding:0.35rem 0;cursor:pointer;color:#f0f0f0;text-align:left;">
+        <span style="display:flex;align-items:baseline;gap:0.6rem;">
+          <span style="font-size:1.05rem;font-weight:600;letter-spacing:-0.01em;">${payday} число</span>
+          <span style="opacity:0.4;font-size:0.75rem;">${when} · ${bucket.length}</span>
+        </span>
+        <span style="display:flex;opacity:0.5;transition:transform .3s ${SPRING};transform:rotate(${expanded ? 90 : 0}deg);">${svg('chevR', 16)}</span>
+      </button>`;
+      if (!expanded) return `<div>${header}</div>`;
+      const rows = bucket.length
+        ? bucket.map((item, i) => recRow(item, i)).join('')
+        : `<div style="opacity:0.3;font-size:0.9rem;padding:0.4rem 0;">пусто</div>`;
+      return `<div>${header}<div style="display:flex;flex-direction:column;gap:0.7rem;margin-top:0.75rem;">${rows}</div></div>`;
     }
     BODY.recurring = () => {
       const items = state.recurring || [];
-      let rows;
       if (items.length === 0) {
-        rows = `<div style="opacity:0.3;padding:2rem 0;font-size:1.05rem;">${state.recurringLoaded ? 'нет платежей' : 'загрузка…'}</div>`;
-      } else {
-        rows = items.map((item, i) => {
-          const cur = curSymbol(item.currency);
-          return `<button data-id="${ea(item.id)}" style="display:flex;align-items:center;gap:0.9rem;width:100%;text-align:left;background:#111;border:1px solid #1c1c1c;border-radius:12px;padding:1rem 1.1rem;cursor:pointer;color:#f0f0f0;animation:rowIn .38s both ${EASE_OUT};animation-delay:${i * 55}ms;transition:transform .25s ${SPRING},border-color .2s;">
-            ${recIcon(item.status, 30)}
-            <div style="flex:1;min-width:0;">
-              <div style="font-size:1.05rem;font-weight:600;letter-spacing:-0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(item.name || item.id)}</div>
-              <div style="opacity:0.45;font-size:0.78rem;margin-top:0.25rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${ea(recSub(item))}</div>
-            </div>
-            <div style="flex-shrink:0;font-weight:600;font-size:1.35rem;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;color:${item.owed > 0 ? '#f0f0f0' : '#5fd37e'};">${disp(item.amount, cur)}</div>
-          </button>`;
-        }).join('');
+        const msg = state.recurringLoaded ? 'нет платежей' : 'загрузка…';
+        return `<div class="lbl-h" style="margin-bottom:1.75rem;">Платежи</div>
+          <div style="opacity:0.3;padding:2rem 0;font-size:1.05rem;">${msg}</div>`;
       }
-      return `<div class="lbl-h" style="margin-bottom:1.75rem;">Платежи</div>
-        <div style="display:flex;flex-direction:column;gap:0.7rem;">${rows}</div>`;
+      const today = state.recToday || AppConfig.today();
+      const overdue = items.filter((i) => i.status === 'overdue');
+      const rest = items.filter((i) => i.status !== 'overdue');
+      const d5 = daysBetweenYMD(today, nextPaydayYMD(today, 5, false));
+      const d20 = daysBetweenYMD(today, nextPaydayYMD(today, 20, false));
+      const nearest = d5 <= d20 ? 5 : 20;
+      // Дефолт раскрытия: ближайший бакет открыт, дальний свёрнут. Сбрасывается
+      // при каждой загрузке (recExpanded=null), ручной тап живёт до перезагрузки.
+      if (!state.recExpanded) state.recExpanded = { 5: nearest === 5, 20: nearest === 20 };
+      const order = nearest === 5 ? [5, 20] : [20, 5];
+      const daysBy = { 5: d5, 20: d20 };
+      let out = `<div class="lbl-h" style="margin-bottom:1.75rem;">Платежи</div>`;
+      if (overdue.length) out += recOverdueSection(overdue);
+      out += `<div style="display:flex;flex-direction:column;gap:1.1rem;">`;
+      order.forEach((p) => {
+        const bucket = rest.filter((i) => Number(i.payday) === p);
+        out += recBucketSection(p, bucket, !!state.recExpanded[p], daysBy[p]);
+      });
+      out += `</div>`;
+      return out;
     };
     WIRE.recurring = () => {
+      document.querySelectorAll('#screen [data-bucket]').forEach((b) =>
+        b.addEventListener('click', () => {
+          const p = Number(b.dataset.bucket);
+          if (!state.recExpanded) state.recExpanded = {};
+          state.recExpanded[p] = !state.recExpanded[p];
+          renderBody();
+        }));
       document.querySelectorAll('#screen [data-id]').forEach((b) =>
         b.addEventListener('click', () => openPaySheet(b.dataset.id)));
     };
@@ -535,16 +617,24 @@
         const data = await res.json();
         AppConfig.cacheFrom(data); // синхронизировать зону с сервером
         state.recurring = Array.isArray(data.items) ? data.items : [];
+        state.recToday = data.today || AppConfig.today();     // YMD в таймзоне (от бэка)
+        state.recLead = (typeof data.lead === 'number') ? data.lead : 3;
+        state.recExpanded = null;                             // пересчитать дефолт раскрытия
         state.recurringLoaded = true;
         if (state.screen === 'recurring') renderBody();
       } catch {}
     }
 
-    // ── Bottom-sheet оплаты (по образцу renderSettings, монтируется в #paysheet-host) ──
+    // ── Bottom-sheet оплаты (payday-модель; монтируется в #paysheet-host) ──
+    // Поле суммы — по умолчанию норма (item.amount), правится. Действия:
+    //   «Оплатил»          → POST /pay {full:true}  — закрыть цикл (статус paid)
+    //   «Внести часть»     → POST /pay {amount:x}   — частичная (paid_amount += x)
+    //   «Перенести → 5/20» → PATCH {defer_to} на дату ближайшего наступления payday
+    // Тело кредита в этом экране не ведём (правило 8): никакого owed/долга.
     function openPaySheet(id) {
       const item = (state.recurring || []).find((x) => x.id === id);
       if (!item) return;
-      state.paySheet = { id, next_due: item.next_due || '', submitting: false };
+      state.paySheet = { id, submitting: false };
       renderPaySheet();
     }
     function closePaySheet() { state.paySheet = null; renderPaySheet(); }
@@ -554,42 +644,53 @@
       const item = (state.recurring || []).find((x) => x.id === state.paySheet.id);
       if (!item) { host.innerHTML = ''; return; }
       const cur = curSymbol(item.currency);
+      const today = state.recToday || AppConfig.today();
+      const sub = recSub(item) || (item.payday + ' число');
+      // Перенос целиком на ближайшее СТРОГО будущее наступление выбранного payday
+      // (strict=true → своя дата уходит в следующий месяц, чужая — в этом/следующем).
+      const deferBtn = (p) => {
+        const to = nextPaydayYMD(today, p, true);
+        return `<button data-defer="${p}" data-date="${to}" style="flex:1;background:transparent;color:#f0f0f0;border:1px solid #262626;border-radius:4px;padding:0.85rem 0.5rem;font-size:0.85rem;font-weight:600;letter-spacing:0.01em;cursor:pointer;transition:transform .42s ${SPRING},opacity .18s ease;">→ ${p} число</button>`;
+      };
+      const amtVal = (item.amount != null && item.amount !== '') ? item.amount : '';
       host.innerHTML = `<div id="pay-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);display:flex;align-items:flex-end;justify-content:center;z-index:50;animation:fadeIn .2s ease;">
         <div id="pay-sheet" style="width:100%;max-width:480px;background:#0e0e0e;border-top:1px solid #1f1f1f;border-radius:12px 12px 0 0;padding:1.75rem 1.6rem calc(env(safe-area-inset-bottom) + 1.6rem);animation:modalIn .32s cubic-bezier(0.34,1.4,0.64,1);">
           <div class="lbl-h" style="margin-bottom:0.5rem;">${ea(item.name || item.id)}</div>
-          <div style="opacity:0.5;font-size:0.85rem;margin-bottom:1.75rem;">Долг ${disp(item.owed, cur)}</div>
-          <div style="margin-bottom:1.5rem;"><div class="lbl-f" style="margin-bottom:0.6rem;">Сумма взноса</div>
-            <div style="display:flex;align-items:baseline;gap:0.4rem;border-bottom:2px solid #262626;padding-bottom:0.5rem;">
-              <input id="pay-amount" placeholder="0" inputmode="decimal" autocomplete="off" style="flex:1;min-width:0;background:transparent;border:none;padding:0;font-size:2rem;font-weight:600;letter-spacing:-0.02em;color:#f0f0f0;font-variant-numeric:tabular-nums;">
+          <div style="opacity:0.5;font-size:0.85rem;margin-bottom:1.75rem;">${ea(sub)}</div>
+          <div id="pay-field" style="margin-bottom:1.75rem;"><div class="lbl-f" style="margin-bottom:0.6rem;">Сумма</div>
+            <div id="pay-underline" style="display:flex;align-items:baseline;gap:0.4rem;border-bottom:2px solid #262626;padding-bottom:0.5rem;transition:border-color .2s ease;">
+              <input id="pay-amount" value="${ea(amtVal)}" placeholder="0" inputmode="decimal" autocomplete="off" style="flex:1;min-width:0;background:transparent;border:none;padding:0;font-size:2rem;font-weight:600;letter-spacing:-0.02em;color:#f0f0f0;font-variant-numeric:tabular-nums;">
               <span style="opacity:0.4;font-size:1.1rem;">${cur}</span>
             </div></div>
-          <div style="margin-bottom:1.75rem;"><div class="lbl-f" style="margin-bottom:0.5rem;">Дата следующего взноса</div>
-            <input id="pay-date" type="date" value="${ea(state.paySheet.next_due || '')}" style="width:100%;background:transparent;border:none;border-bottom:1px solid #262626;border-radius:0;padding:0.4rem 0 0.6rem;font-size:1.05rem;color:#f0f0f0;color-scheme:dark;"></div>
-          <button id="pay-submit" style="width:100%;background:${ACC};color:#0a0a0a;border:none;border-radius:4px;padding:1.2rem;font-size:1rem;font-weight:600;text-transform:uppercase;letter-spacing:0.02em;cursor:pointer;transition:transform .42s ${SPRING},box-shadow .3s,opacity .18s ease;margin-bottom:0.8rem;">Внести</button>
-          <button id="pay-full" style="width:100%;background:transparent;color:#f0f0f0;border:1px solid #262626;border-radius:4px;padding:1.1rem;font-size:0.95rem;font-weight:600;text-transform:uppercase;letter-spacing:0.02em;cursor:pointer;transition:transform .42s ${SPRING},opacity .18s ease;">Оплатил полностью</button>
+          <button id="pay-full" style="width:100%;background:${ACC};color:#0a0a0a;border:none;border-radius:4px;padding:1.2rem;font-size:1rem;font-weight:600;text-transform:uppercase;letter-spacing:0.02em;cursor:pointer;transition:transform .42s ${SPRING},box-shadow .3s,opacity .18s ease;margin-bottom:0.8rem;">Оплатил</button>
+          <button id="pay-part" style="width:100%;background:transparent;color:#f0f0f0;border:1px solid #262626;border-radius:4px;padding:1.1rem;font-size:0.95rem;font-weight:600;text-transform:uppercase;letter-spacing:0.02em;cursor:pointer;transition:transform .42s ${SPRING},opacity .18s ease;margin-bottom:1.6rem;">Внести часть</button>
+          <div class="lbl-f" style="margin-bottom:0.6rem;">Перенести</div>
+          <div style="display:flex;gap:0.7rem;">${deferBtn(5)}${deferBtn(20)}</div>
         </div></div>`;
       el('pay-overlay').addEventListener('click', closePaySheet);
       el('pay-sheet').addEventListener('click', (e) => e.stopPropagation());
-      const dt = el('pay-date');
-      dt.addEventListener('focus', () => { dt.style.borderBottomColor = ACC; });
-      dt.addEventListener('blur', () => { dt.style.borderBottomColor = '#262626'; });
-      dt.addEventListener('input', (e) => { state.paySheet.next_due = e.target.value; });
-      const submit = el('pay-submit');
-      submit.addEventListener('click', () => submitPay('amount'));
-      pressBtn(submit);
+      const amt = el('pay-amount'), underline = el('pay-underline');
+      amt.addEventListener('focus', () => { underline.style.borderBottomColor = ACC; });
+      amt.addEventListener('blur', () => { underline.style.borderBottomColor = '#262626'; });
       const full = el('pay-full');
       full.addEventListener('click', () => submitPay('full'));
-      pressBtn(full, 'scale(0.96)');
+      pressBtn(full);
+      const part = el('pay-part');
+      part.addEventListener('click', () => submitPay('partial'));
+      pressBtn(part, 'scale(0.96)');
+      document.querySelectorAll('#pay-sheet [data-defer]').forEach((b) => {
+        b.addEventListener('click', () => submitDefer(Number(b.dataset.defer), b.dataset.date));
+        pressBtn(b, 'scale(0.96)');
+      });
     }
-    // POST /api/recurring/:id/pay → {amount} или {full:true} (+ next_due, если
-    // остаётся долг и задана дата). Кнопки блокируются от двойного тапа.
+    // POST /api/recurring/:id/pay → {full:true} (полная) или {amount:x} (частичная).
+    // Ответ {item, prev}: item обновляет строку в стейте, prev — для undo. Кнопки
+    // блокируются от двойного тапа. Balances не трогаем (правило 8).
     async function submitPay(mode) {
       const ps = state.paySheet;
       if (!ps || ps.submitting) return;
       const item = (state.recurring || []).find((x) => x.id === ps.id);
       if (!item) return;
-      const sBtn = el('pay-submit'), fBtn = el('pay-full');
-      const setBusy = (busy) => [sBtn, fBtn].forEach((b) => { if (b) { b.disabled = busy; b.style.opacity = busy ? '0.5' : '1'; } });
       let body;
       if (mode === 'full') {
         body = { full: true };
@@ -597,9 +698,9 @@
         const amt = parseAmount(el('pay-amount').value);
         if (amt === null) { showToast('Введи сумму'); return; }
         body = { amount: amt };
-        const nd = (el('pay-date').value || '').trim();
-        if (nd && amt < Number(item.owed)) body.next_due = nd;
       }
+      const btns = ['pay-full', 'pay-part'].map(el);
+      const setBusy = (busy) => btns.forEach((b) => { if (b) { b.disabled = busy; b.style.opacity = busy ? '0.5' : '1'; } });
       ps.submitting = true;
       setBusy(true);
       try {
@@ -615,20 +716,46 @@
         const idx = state.recurring.findIndex((x) => x.id === ps.id);
         if (idx >= 0 && data.item) state.recurring[idx] = data.item;
         closePaySheet();
-        if (state.screen === 'recurring') renderBody();
+        if (state.screen === 'recurring') renderBody(); // статус/секция «Просрочено» пересчитаются
         showToast(recPaySummary(item, body), state.pendingRecurringUndo.prev ? { undo: undoRecurring } : {});
       } catch {
         showToast('Нет соединения');
         ps.submitting = false; setBusy(false);
       }
     }
+    // Перенос целиком: PATCH /api/recurring/:id {defer_to:'YYYY-MM-DD'}. Двигает
+    // срок платежа, суммы между месяцами не складываются (первая версия модели).
+    // Перезагружаем список — статусы/бакеты считает бэк.
+    async function submitDefer(payday, date) {
+      const ps = state.paySheet;
+      if (!ps || ps.submitting) return;
+      const item = (state.recurring || []).find((x) => x.id === ps.id);
+      if (!item) return;
+      ps.submitting = true;
+      document.querySelectorAll('#pay-sheet button').forEach((b) => { b.disabled = true; b.style.opacity = '0.5'; });
+      try {
+        const res = await api('PATCH', `/api/recurring/${encodeURIComponent(ps.id)}`, { defer_to: date });
+        if (!res.ok) {
+          let d = ''; try { d = (await res.json()).error || ''; } catch {}
+          showToast('Ошибка ' + res.status + (d ? ' · ' + d : ''));
+          ps.submitting = false; renderPaySheet();
+          return;
+        }
+        closePaySheet();
+        showToast(`${item.name || item.id} · перенос на ${fmtDate(date)}`);
+        loadRecurring();
+      } catch {
+        showToast('Нет соединения');
+        ps.submitting = false; renderPaySheet();
+      }
+    }
     function recPaySummary(item, body) {
       const nm = item.name || item.id;
-      if (body.full) return `${nm} · оплачено полностью`;
+      if (body.full) return `${nm} · оплачено`;
       return `${nm} · внесено ${disp(body.amount, curSymbol(item.currency))}`;
     }
-    // Undo оплаты: PATCH сырым prev из ответа pay (owed=owed_base, cycle,
-    // last_paid, next_due — НЕ вычисленный owed), затем перезагрузка.
+    // Undo оплаты: PATCH сырым prev из ответа /pay (сырые поля строки Recurring —
+    // paid_amount, cycle, last_paid, defer_to — как были ДО оплаты), затем перезагрузка.
     async function undoRecurring() {
       const u = state.pendingRecurringUndo;
       if (!u || !u.prev) return;

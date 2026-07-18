@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, loadSA, spreadsheetId, getToken, valuesGet } from './_lib.mjs';
 
-const SHEETS = ['Events', 'Balances'];
+const SHEETS = ['Events', 'Balances', 'Recurring'];
 
 (async () => {
   const id = spreadsheetId();
