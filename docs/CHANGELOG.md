@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-07-18 — Крипто: баланс bybit, чистка лога, watchdog v2 ✅
+
+Три пункта постановки `docs/specs/crypto-reconciliation.md` (цепочка 1→2→3). Данные/бэкенд
+крипто-слоя: правильный баланс bybit, лог без заплаток, добавлена сверка целостности.
+
+### П.1 — bybit Earn виден (`scripts/crypto-poller.mjs`)
+`fetchBybit` считал только UNIFIED-кошелёк и показывал `0`, хотя деньги лежали в Bybit Earn.
+Теперь счёт `bybit` = сумма трёх сегментов USDT: `UNIFIED.walletBalance + FUND.transferBalance +
+Σ Earn(FlexibleSaving).amount` (principal, без `claimableYield`). Добавлены `fetchBybitFunding`,
+`fetchBybitEarn`; `bybitGet` получил режим `soft` — необязательный сегмент (нет прав / пусто /
+`retCode!=0`) даёт вклад 0 и не роняет поллер. Приёмка `--dry-run`: `bybit(USDT)=112.01`
+(UNIFIED=0 · FUND=0.01 · Earn=112).
+
+### П.2 — чистка лога (через API, под бэкапом)
+Удалено 9 крипто-строк `log_only:false` из `Events`: искусственные заплатки (baseline/correction)
+и уже-задвоенные backfill'ом дубли переводов. Каждое реальное движение осталось в логе один раз
+(16 движений + backfill-поток). После чистки — боевой снимок поллера выровнял балансы
+(`trustwallet=0`, `bybit=112.01`). Правки только через API (правило 1), с предварительным бэкапом
+листов (`scripts/_backups/`). Удаление — по явному согласию владельца.
+
+### П.3 — watchdog v2, сверка целостности (`scripts/watchdog.mjs`)
+Реализован `TODO(v2)`: сверка «снимок ?= старт + Σ `log_only`-операций» для зеркалимых снимком
+счетов. Читает `GET /api/events` + `GET /api/balances`, сворачивает мутации `log_only:true`
+событий (логика `applyMutation`: income/+, expense/−, transfer, exchange) от старта 0, сравнивает
+со снимком, дельта > epsilon → тревога с разбивкой по счёту (канал как v1: stderr+exit).
+
 ## 2026-07-18 — `Recurring` перестроен под payday-модель ✅ (задеплоено, `c1a0320`)
 
 Экран регулярных платежей переведён с банковских дат + начисления долга на **payday-бакеты

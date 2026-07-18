@@ -162,7 +162,10 @@ async function fetchTrustwallet() {
 // --- bybit V5 (приватный, HMAC) ---
 // sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + queryString).
 // Транзиентные сбои / WAF → ретраим по HTTP-статусу с backoff (retCode-ошибки — фатальны).
-async function bybitGet(path, query = '', attempt = 0) {
+// soft=true: не звать die() — вместо фатала бросить Error (для необязательных сегментов
+// FUND/Earn, где пустой список / отсутствие прав должны давать вклад 0, а не падение).
+async function bybitGet(path, query = '', attempt = 0, soft = false) {
+  const fail = (msg) => { if (soft) throw new Error(msg); die(msg); };
   const apiKey = env('BYBIT_API_KEY');
   const apiSecret = env('BYBIT_API_KEY_SECRET');
   const ts = Date.now().toString();
@@ -185,9 +188,9 @@ async function bybitGet(path, query = '', attempt = 0) {
       const wait = Math.min(30000, 2000 * 2 ** attempt);
       console.error(`  · bybit сбой (${e.message?.slice(0, 60)}) — retry через ${wait / 1000}s (${attempt + 1}/4)`);
       await sleep(wait);
-      return bybitGet(path, query, attempt + 1);
+      return bybitGet(path, query, attempt + 1, soft);
     }
-    die(`bybit ${path}: ${e.message}`);
+    return fail(`bybit ${path}: ${e.message}`);
   }
   if (!res.ok) {
     const text = (await res.text()).slice(0, 300);
@@ -195,27 +198,69 @@ async function bybitGet(path, query = '', attempt = 0) {
       const wait = Math.min(30000, 2000 * 2 ** attempt);
       console.error(`  · bybit ${res.status} — retry через ${wait / 1000}s (${attempt + 1}/4)`);
       await sleep(wait);
-      return bybitGet(path, query, attempt + 1);
+      return bybitGet(path, query, attempt + 1, soft);
     }
-    die(`bybit ${path} ${res.status}: ${text}`);
+    return fail(`bybit ${path} ${res.status}: ${text}`);
   }
   const data = await res.json();
-  if (data.retCode !== 0) die(`bybit ${path} retCode=${data.retCode}: ${data.retMsg}`);
+  if (data.retCode !== 0) return fail(`bybit ${path} retCode=${data.retCode}: ${data.retMsg}`);
   return data.result;
 }
 
-// Баланс BYBIT (USDT в UNIFIED-аккаунте). Если монеты USDT нет в списке → 0.
+// USDT в Funding-аккаунте (FUND). Необязательный сегмент — пусто/нет прав/ошибка → 0.
+async function fetchBybitFunding() {
+  try {
+    const r = await bybitGet('/v5/asset/transfer/query-account-coins-balance', 'accountType=FUND&coin=USDT', 0, true);
+    for (const b of (r && r.balance) || []) {
+      if (b.coin === 'USDT') {
+        const v = Number(b.transferBalance ?? b.walletBalance);
+        return Number.isFinite(v) ? round2(v) : 0;
+      }
+    }
+  } catch (e) {
+    console.error(`  · bybit FUND недоступен → 0 (${e.message?.slice(0, 80)})`);
+  }
+  return 0;
+}
+
+// USDT в Bybit Earn (FlexibleSaving) — principal (result.list[].amount), без claimableYield.
+// Необязательный сегмент — пусто/нет прав/ошибка → 0.
+async function fetchBybitEarn() {
+  try {
+    const r = await bybitGet('/v5/earn/position', 'category=FlexibleSaving', 0, true);
+    let sum = 0;
+    for (const p of (r && r.list) || []) {
+      if (p.coin === 'USDT') {
+        const v = Number(p.amount);
+        if (Number.isFinite(v)) sum += v;
+      }
+    }
+    return round2(sum);
+  } catch (e) {
+    console.error(`  · bybit Earn недоступен → 0 (${e.message?.slice(0, 80)})`);
+  }
+  return 0;
+}
+
+// Баланс BYBIT (USDT) = сумма всех сегментов: UNIFIED (торговый) + FUND (funding) + Earn
+// (FlexibleSaving principal). UNIFIED основной — падение фатально; FUND/Earn необязательны
+// (пусто/нет прав → 0). Единый счёт `bybit`, чтобы перенос средств внутри bybit не терялся.
 async function fetchBybit() {
   const wallet = await bybitGet('/v5/account/wallet-balance', 'accountType=UNIFIED');
+  let unified = 0;
   for (const acc of wallet.list || []) {
     for (const c of acc.coin || []) {
       if (c.coin === 'USDT') {
         const bal = Number(c.walletBalance);
-        return Number.isFinite(bal) ? round2(bal) : 0;
+        unified = Number.isFinite(bal) ? round2(bal) : 0;
       }
     }
   }
-  return 0;
+  const funding = await fetchBybitFunding();
+  const earn = await fetchBybitEarn();
+  const total = round2(unified + funding + earn);
+  if (DRY) console.log(`  · bybit сегменты: UNIFIED=${unified} FUND=${funding} Earn=${earn} → ${total}`);
+  return total;
 }
 
 // --- Операции: TRC20-переводы trustwallet (Trongrid) ---

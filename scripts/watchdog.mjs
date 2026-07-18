@@ -166,13 +166,103 @@ async function main() {
 
   console.log(`[watchdog${DRY ? ' DRY' : ''}] OK — данные свежие`);
 
-  // TODO(v2): сверка целостности «снимок ?= стартовый баланс + Σ операций из лога».
-  // Здесь читаем GET /api/events (весь лог, с фильтрами ?type=/?limit=), сворачиваем
-  // мутации (applyMutation-логика: income/+, expense/−, transfer, exchange) от известной
-  // стартовой точки каждого счёта и сравниваем с текущим amount из /api/balances.
-  // Расхождение сверх epsilon (учитывая log_only-события, которые баланс НЕ двигают, и
-  // счета, зеркалимые снимком) → тревога «дрейф баланса». В v1 НЕ реализовано намеренно:
-  // v1 ловит только устаревание updated_at (самый частый и дешёвый сигнал поломки).
+  // v2: сверка целостности «снимок ?= старт + Σ операций из лога».
+  await reconcile(data);
+}
+
+// --- v2: сверка целостности зеркалимых счетов ----------------------------------
+// Расхождение считаем значимым, если |дельта| > EPS (копеечный шум float — не сигнал).
+const RECON_EPS = 0.01;
+const cents = (x) => Math.round(x * 100) / 100;
+
+// Вклад ОДНОГО события в баланс КОНКРЕТНОГО счёта (та же логика, что applyMutation
+// в api/src/index.js:731-749, но развёрнутая «по счёту»: сколько это событие
+// прибавляет/убавляет именно на acc). Событие ссылается на счёт через from/to.
+//   income   : +amount     на to
+//   expense  : −amount     с from
+//   transfer : −amount c from, +amount на to (та же валюта)
+//   exchange : −amount c from, +amount_to на to (разные валюты — потому amount_to)
+// Счёт, не затронутый событием, получает 0.
+function deltaForAccount(event, acc) {
+  const amt = event.amount || 0;
+  const amtTo = event.amount_to || 0;
+  switch (event.type) {
+    case 'income':
+      return event.to === acc ? amt : 0;
+    case 'expense':
+      return event.from === acc ? -amt : 0;
+    case 'transfer':
+      return (event.from === acc ? -amt : 0) + (event.to === acc ? amt : 0);
+    case 'exchange':
+      return (event.from === acc ? -amt : 0) + (event.to === acc ? amtTo : 0);
+    default:
+      return 0; // неизвестный тип — не двигаем (как и applyMutation бросил бы, но здесь мягко)
+  }
+}
+
+// Модель (api/src/index.js): зеркалимые счета ведутся СНИМКОМ (authority=direct, баланс
+// SET из источника), а log_only:true события баланс НЕ двигают — они и есть «поток
+// операций» для этих счетов. Сверка проверяет полноту потока: если снимок=X, а свёртка
+// log_only-операций счёта=Y, то дельта X−Y = пропущенные/лишние операции.
+//
+// СТАРТ свёртки = 0 (дефолт по спеке crypto-reconciliation.md:113): сворачиваем ВСЕ
+// log_only-события счёта от нуля. Явный anchor в Balances спекой допускается, но не
+// используется — старт нулевой, поэтому «старт + Σоп» = чистая Σ log_only-мутаций.
+//
+// МНОЖЕСТВО зеркалимых счетов выводим ДАННЫМИ, а не хардкодом: зеркалимый счёт — это
+// любой счёт, на который ссылается хотя бы одно log_only-событие (crypto trustwallet/
+// bybit, maxswap, zenmoney-счета — их поллеры пишут поток именно log_only-событиями).
+// Так набор переживает переименования/новые источники без правок кода.
+async function reconcile(balances) {
+  const snapshot = new Map();
+  for (const a of (balances.accounts || [])) snapshot.set(a.id, a);
+
+  const { events } = await api('GET', '/events'); // весь лог, oldest-first
+  const logOnly = (events || []).filter((e) => e.log_only === true);
+
+  // Зеркалимые счета = все счета, упомянутые в log_only-событиях (from/to).
+  const mirrored = new Set();
+  for (const e of logOnly) {
+    if (e.from) mirrored.add(e.from);
+    if (e.to) mirrored.add(e.to);
+  }
+
+  if (mirrored.size === 0) {
+    console.log(`[watchdog${DRY ? ' DRY' : ''}] сверка: log_only-событий нет — нечего сверять`);
+    return;
+  }
+
+  const drift = [];
+  console.log(`[watchdog${DRY ? ' DRY' : ''}] сверка целостности (старт=0, Σ log_only-операций):`);
+  for (const acc of [...mirrored].sort()) {
+    // Σ операций счёта = свёртка вкладов всех его log_only-событий от старта 0.
+    let sum = 0;
+    for (const e of logOnly) sum += deltaForAccount(e, acc);
+    const computed = cents(sum);          // старт(0) + Σоп
+    const snap = snapshot.get(acc);
+    const snapAmt = snap ? cents(snap.amount) : null;
+    const delta = snapAmt == null ? null : cents(snapAmt - computed);
+    const snapStr = snapAmt == null ? 'нет в /api/balances' : snapAmt;
+    console.log(`  ${acc}: снимок=${snapStr}, старт+Σоп=${computed}, дельта=${delta == null ? '—' : delta}`);
+    if (delta != null && Math.abs(delta) > RECON_EPS) {
+      drift.push({ acc, snap: snapAmt, computed, delta });
+    }
+  }
+
+  if (drift.length === 0) {
+    console.log(`[watchdog${DRY ? ' DRY' : ''}] сверка OK — целостность потока сходится`);
+    return;
+  }
+
+  const lines = drift.map(
+    (d) => `• ${d.acc}: снимок=${d.snap}, старт+Σоп=${d.computed}, дельта=${d.delta}`
+  );
+  const delivered = await alert(
+    `⚠ Финансы: дрейф баланса — снимок не сходится с потоком log_only-операций.\n` +
+    `Дельта = пропущенные/лишние операции в логе по счёту:\n${lines.join('\n')}`
+  );
+  // Тревога доставлена каналом (или dry-run) → exit 0; канала нет → exit 1 (cron заметит).
+  process.exit(delivered ? 0 : 1);
 }
 
 main().catch((e) => die(e.message));
