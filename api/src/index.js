@@ -636,11 +636,12 @@ async function handleQuickExpense(req, env) {
 // amount. Validated all-or-nothing — an unknown id rejects the whole batch.
 //
 // NOTE on double-counting: an account mirrored by snapshot must NOT also have its
-// operations mutate the balance (that would move it twice). Logging the source's
-// operations for analytics/watchdog without touching the balance ("log-only"
-// events) is the coupled next step — it needs an Events schema column so PATCH/
-// DELETE don't reverse a mutation that never happened. Speced in
-// dev/notes/aggregator-design.md; not implemented here.
+// operations mutate the balance (that would move it twice). Its operations are
+// still logged for analytics/watchdog via log-only events (Events!K, the
+// log_only flag) — the balance is left untouched, and PATCH/DELETE read the flag
+// so they don't reverse a mutation that never happened. Implemented; pollers
+// (zenmoney, crypto) already write log-only events this way. See
+// docs/private/aggregator-design.md.
 async function handleSnapshot(req, env) {
   let body;
   try { body = await req.json(); } catch { return error(400, 'invalid json'); }
