@@ -40,5 +40,8 @@ scripts/_backups/
 # debts, account ids) — never commit. The whole docs/private/ tree is local-only.
 docs/private/
 
+# Specs hold постановки with real credit amounts — local-only, never commit.
+docs/specs/
+
 # Contains BIDV statement password hardcoded — never commit as-is
 scripts/import-bidv.py
