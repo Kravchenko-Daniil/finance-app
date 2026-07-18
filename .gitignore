@@ -45,3 +45,6 @@ docs/specs/
 
 # Contains BIDV statement password hardcoded — never commit as-is
 scripts/import-bidv.py
+
+# ADW — внутренний лог итераций arche/orchestrate
+.adw/
