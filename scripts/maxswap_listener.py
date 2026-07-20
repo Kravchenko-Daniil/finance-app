@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-MaxSwap-листенер: читает диалог с @MaxSwap_bot через MTProto (юзер-сессия), парсит
-сообщения (maxswap_parser) и пишет в finance-API — snapshot баланса карты + log_only
-события покупок/возвратов. Дедуп/идемпотентность по client_id = tg_<msgId>.
+Мультиисточник-листенер (исторически «MaxSwap»): читает диалоги через MTProto
+(юзер-сессия) и пишет в finance-API. Обслуживает несколько источников одним процессом:
+
+- maxswap: диалог с @MaxSwap_bot → maxswap_parser → snapshot баланса карты + log_only
+  события покупок/возвратов. Дедуп/идемпотентность по client_id = tg_<msgId>.
+- denis: приватный диалог обмена USDT→THB (denis_parser, машина состояний на диске) →
+  пара событий на завершённый обмен. Поднимается только если задан DENIS_TG_PEER в .env
+  (иначе тихо деградирует до одного maxswap). Идентификатор человека — вне кода (§9 спеки).
+
+Каждый источник ведёт СВОЙ курсор в scripts/.state/<name>.json.
 
 Это «Сигнал 1 (снимок) + Сигнал 2 (поток)» из aggregator-design.md §2 для счёта maxswap.
 Always-on слушатель (для VPS) + одноразовый backfill истории.
@@ -28,14 +35,17 @@ Always-on слушатель (для VPS) + одноразовый backfill ис
 import os
 import sys
 import json
+import time
 import base64
 import asyncio
 import urllib.request
 import urllib.error
 import urllib.parse
+from collections import namedtuple
 from datetime import datetime, timezone
 
 from maxswap_parser import parse_message, message_to_actions
+from denis_parser import classify, build_events, _pending_expired
 
 # Логи always-on сервиса — построчно, чтобы systemd-journal видел их сразу (без -u).
 sys.stdout.reconfigure(line_buffering=True)
@@ -47,7 +57,11 @@ START_DATE = datetime(2026, 4, 10, tzinfo=timezone.utc)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV = os.path.join(ROOT, ".env")
 STATE_DIR = os.path.join(ROOT, "scripts", ".state")
-STATE_FILE = os.path.join(STATE_DIR, "maxswap.json")
+# Раздельные курсоры по источникам (id-пространства диалогов независимы).
+MAXSWAP_STATE = os.path.join(STATE_DIR, "maxswap.json")
+DENIS_STATE = os.path.join(STATE_DIR, "denis.json")
+# Один активный обмен с @denis: pending на диске (переживает рестарт). null/нет файла = нет обмена.
+DENIS_PENDING = os.path.join(STATE_DIR, "denis_pending.json")
 
 BOT = "MaxSwap_bot"
 API_BASE = "https://finance.daniilkravchenko.com/api"
@@ -93,20 +107,20 @@ def env(key, required=True):
     return None
 
 
-# --- Курсор (последний обработанный msg_id) ---
-def load_cursor():
+# --- Курсор (последний обработанный msg_id), параметризован файлом источника ---
+def load_cursor(path):
     try:
-        with open(STATE_FILE) as f:
+        with open(path) as f:
             return int(json.load(f).get("last_msg_id", 0))
     except (FileNotFoundError, ValueError, json.JSONDecodeError):
         return 0
 
 
-def save_cursor(msg_id):
+def save_cursor(path, msg_id):
     if DRY:
         return
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
+    with open(path, "w") as f:
         json.dump({"last_msg_id": int(msg_id)}, f)
 
 
@@ -159,6 +173,124 @@ def process(text, msg_id, at_iso, only_events=False):
         except RuntimeError as e:
             out.append(f"ERROR: {e}")
     return out
+
+
+# --- Мультиисточник: единый интерфейс сообщения для handle (§4.2) ---
+# handle работает в двух режимах (live event / catch-up Message). Чтобы он не зависел
+# от типа объекта, ОБА режима приводят входное сообщение к этому тонкому виду и handle
+# читает ТОЛЬКО .out/.id/.date/.text (chat/направление разрулены выбором хендлера на входе).
+Msg = namedtuple("Msg", ["out", "id", "date", "text"])
+
+
+def _wrap(m):
+    """Telethon Message → единый Msg(.out/.id/.date/.text). Общий для live и catch-up."""
+    return Msg(out=bool(getattr(m, "out", False)), id=m.id, date=m.date, text=m.message or "")
+
+
+# --- Denis: pending-состояние обмена на диске (один активный обмен) ---
+def load_pending():
+    try:
+        with open(DENIS_PENDING) as f:
+            data = json.load(f)
+        return data or None
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def save_pending(pending):
+    if DRY:
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(DENIS_PENDING, "w") as f:
+        json.dump(pending, f)
+
+
+def clear_pending():
+    if DRY:
+        return
+    try:
+        os.remove(DENIS_PENDING)
+    except FileNotFoundError:
+        pass
+
+
+# --- Handle источников (источник-нейтральный run_action/process переиспользуются) ---
+def maxswap_handle(msg):
+    """maxswap-ветка без изменений поведения: process → snapshot + log_only-события."""
+    at_iso = msg.date.isoformat() if msg.date else None
+    for r in process(msg.text or "", msg.id, at_iso):
+        print(f"  [maxswap] id={msg.id} → {r}")
+
+
+def denis_handle(msg):
+    """denis-ветка: машина состояний обмена USDT→THB (§5).
+
+    is_out различает оффер (входящее Дениса) от завершения (исходящее Даниила).
+    pending на диске; при завершении — пара событий build_events → run_action ×2 (THB, USDT).
+    """
+    is_out = bool(msg.out)
+    res = classify(msg.text or "", is_out)
+    if res is None:
+        return  # промежуточное / нерелевантное — pending не трогаем
+
+    kind = res.get("kind")
+
+    # offer: входящее Дениса — перезаписать pending, в API ничего не писать
+    if kind == "offer" and not is_out:
+        pending = {
+            "offer_msg_id": msg.id,
+            "usdt": res["usdt"],
+            "thb": res["thb"],
+            "rate": res["rate"],
+            "offer_ts": msg.date.isoformat() if msg.date else None,
+        }
+        save_pending(pending)
+        print(f"  [denis] offer id={msg.id} usdt={res['usdt']} thb={res['thb']} "
+              f"rate={res['rate']} → pending set")
+        return
+
+    # completion: исходящее Даниила И есть pending
+    if kind == "completion" and is_out:
+        pending = load_pending()
+        if not pending:
+            print(f"  [denis] completion id={msg.id} но pending пуст → игнор")
+            return
+        # TTL (§5.3, место 2): протухший оффер — дроп без записи событий
+        now = msg.date if msg.date else datetime.now(timezone.utc)
+        if _pending_expired(pending, now):
+            print(f"  [denis] completion id={msg.id} но pending протух (>24ч) → дроп, событий нет")
+            clear_pending()
+            return
+        completion_ts = (msg.date.isoformat() if msg.date
+                         else datetime.now(timezone.utc).isoformat())
+        actions = build_events(pending, completion_ts)
+        ok = True
+        for idx, a in enumerate(actions):
+            if idx > 0:
+                time.sleep(0.25)  # /event сканит весь лог — не спамим (как в поллерах)
+            try:
+                r = run_action(a)
+                print(f"  [denis] completion id={msg.id} → {r}")
+            except RuntimeError as e:
+                ok = False
+                print(f"  [denis] completion id={msg.id} → ERROR: {e}")
+        if ok:
+            clear_pending()
+        else:
+            print("  [denis] пара записана не полностью — pending сохранён "
+                  "(идемпотентность по client_id спасёт при повторе)")
+        return
+
+    # прочее (completion без is_out, offer с is_out и т.п.) — игнор
+    return
+
+
+def denis_startup_ttl():
+    """§5.3 место 1: при старте, ДО catch-up — снести протухший pending."""
+    pending = load_pending()
+    if pending and _pending_expired(pending, datetime.now(timezone.utc)):
+        print("[denis] стартовый TTL: pending протух (>24ч) → дроп")
+        clear_pending()
 
 
 # --- Авточтение баланса карты через backend мини-аппа MaxSwap ---
@@ -373,7 +505,7 @@ async def do_test_balance(client):
 
 
 async def do_backfill(client, entity):
-    since = load_cursor()
+    since = load_cursor(MAXSWAP_STATE)
     print(f"[backfill{' DRY' if DRY else ''}] с msg_id>{since} из @{BOT}\n")
     msgs = []
     async for m in client.iter_messages(entity, min_id=since):
@@ -400,40 +532,52 @@ async def do_backfill(client, entity):
         last_id = max(last_id, m.id)
     # курсор НЕ двигаем при --max (это smoke, не полный проход) и при dry-run
     if not MAX:
-        save_cursor(last_id)
+        save_cursor(MAXSWAP_STATE, last_id)
     print(f"  (пропущено до старта трекера {START_DATE.date()}: {n_skip})")
     print(f"\n[backfill{' DRY' if DRY else ''}] сообщений с действиями: {n_msg}, "
           f"действий: {n_act}, курсор→{last_id}")
 
 
-async def run_live(client, entity):
-    # catch-up: всё, что пришло пока листенер лежал
-    since = load_cursor()
-    print(f"[live] catch-up с msg_id>{since}…")
-    catchup = []
-    async for m in client.iter_messages(entity, min_id=since):
-        catchup.append(m)
-    catchup.reverse()
-    for m in catchup:
-        at_iso = m.date.isoformat() if m.date else None
-        for r in process(m.message or "", m.id, at_iso):  # live: snapshot + события
-            print(f"  catchup id={m.id} → {r}")
-        save_cursor(m.id)
-
+async def run_live(client, sources):
+    """Мультиисточник-live: раздельный catch-up по каждому источнику, затем раздельные
+    хендлеры. Каждый источник ведёт СВОЙ курсор; handle един (работает через _wrap)."""
     from telethon import events
 
-    @client.on(events.NewMessage(from_users=entity))
-    async def handler(event):
-        m = event.message
-        at_iso = m.date.isoformat() if m.date else None
-        for r in process(m.message or "", m.id, at_iso):
-            print(f"  live id={m.id} → {r}")
-        save_cursor(m.id)
+    # catch-up по каждому источнику отдельно (id-пространства диалогов независимы)
+    for s in sources:
+        cur = load_cursor(s["state_file"])
+        print(f"[live] catch-up {s['name']} с msg_id>{cur}…")
+        catchup = []
+        async for m in client.iter_messages(s["entity"], min_id=cur):
+            catchup.append(m)
+        catchup.reverse()
+        for m in catchup:
+            s["handle"](_wrap(m))
+            save_cursor(s["state_file"], m.id)
+
+    by_name = {s["name"]: s for s in sources}
+    maxswap_source = by_name.get("maxswap")
+    denis_source = by_name.get("denis")
+
+    # maxswap — по отправителю (бот, исходящих там не бывает)
+    if maxswap_source:
+        @client.on(events.NewMessage(from_users=maxswap_source["entity"]))
+        async def on_maxswap(event):
+            maxswap_source["handle"](_wrap(event.message))
+            save_cursor(maxswap_source["state_file"], event.message.id)
+
+    # denis — по ЧАТУ (chats=), чтобы ловить ОБА направления; is_out различает внутри
+    if denis_source:
+        @client.on(events.NewMessage(chats=denis_source["entity"]))
+        async def on_denis(event):
+            denis_source["handle"](_wrap(event.message))
+            save_cursor(denis_source["state_file"], event.message.id)
 
     # Периодическое авточтение баланса карты (снимок maxswap) — изолированный таск.
     asyncio.create_task(balance_scheduler(client))
 
-    print(f"[live] слушаю @{BOT}. Ctrl-C для остановки.")
+    names = ", ".join(s["name"] for s in sources)
+    print(f"[live] слушаю: {names}. Ctrl-C для остановки.")
     await client.run_until_disconnected()
 
 
@@ -453,12 +597,46 @@ async def main():
         await client.disconnect()
         return
 
-    entity = await client.get_entity(BOT)
+    maxswap_entity = await client.get_entity(BOT)
 
     if BACKFILL:
-        await do_backfill(client, entity)
+        # backfill остаётся единолично maxswap-специфичным (denis backfill вне v1)
+        await do_backfill(client, maxswap_entity)
+        await client.disconnect()
+        return
+
+    # --- Реестр источников (§4.2) ---
+    sources = [{
+        "name": "maxswap",
+        "entity": maxswap_entity,
+        "state_file": MAXSWAP_STATE,
+        "handle": maxswap_handle,
+    }]
+
+    # denis — приватный источник: идентификатор ТОЛЬКО из .env (§9). Нет переменной →
+    # источник не поднимается, maxswap работает как раньше (грациозная деградация).
+    denis_peer = env("DENIS_TG_PEER", required=False)
+    if denis_peer:
+        try:
+            denis_entity = await client.get_entity(denis_peer)
+            sources.append({
+                "name": "denis",
+                "entity": denis_entity,
+                "state_file": DENIS_STATE,
+                "handle": denis_handle,
+            })
+            print("[live] источник denis подключён")
+        except Exception as e:  # noqa: BLE001 — отсутствие denis не должно ронять maxswap
+            print(f"[live] denis не подключён (resolve entity не удался: {e}); "
+                  f"работаю только maxswap")
     else:
-        await run_live(client, entity)
+        print("[live] DENIS_TG_PEER не задан — источник denis не поднимается; "
+              "работаю только maxswap")
+
+    # TTL при старте, ДО catch-up: снести протухший pending обмена (§5.3 место 1)
+    denis_startup_ttl()
+
+    await run_live(client, sources)
     await client.disconnect()
 
 
