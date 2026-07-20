@@ -230,6 +230,9 @@ def denis_handle(msg):
     """
     is_out = bool(msg.out)
     res = classify(msg.text or "", is_out)
+    # квитанция приёма (без текста сообщения — только метаданные): нужна для проверки
+    # направления §4.2 (chats= ловит исходящие Даниила) и общей наблюдаемости.
+    print(f"  [denis] rx id={msg.id} out={is_out} kind={res.get('kind') if res else None}")
     if res is None:
         return  # промежуточное / нерелевантное — pending не трогаем
 
