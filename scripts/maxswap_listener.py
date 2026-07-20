@@ -6,7 +6,7 @@
 - maxswap: диалог с @MaxSwap_bot → maxswap_parser → snapshot баланса карты + log_only
   события покупок/возвратов. Дедуп/идемпотентность по client_id = tg_<msgId>.
 - denis: приватный диалог обмена USDT→THB (denis_parser, машина состояний на диске) →
-  пара событий на завершённый обмен. Поднимается только если задан DENIS_TG_PEER в .env
+  пара событий на завершённый обмен. Поднимается только если задан TELEGRAM_EXCHANGE_USERNAME в .env
   (иначе тихо деградирует до одного maxswap). Идентификатор человека — вне кода (§9 спеки).
 
 Каждый источник ведёт СВОЙ курсор в scripts/.state/<name>.json.
@@ -615,7 +615,7 @@ async def main():
 
     # denis — приватный источник: идентификатор ТОЛЬКО из .env (§9). Нет переменной →
     # источник не поднимается, maxswap работает как раньше (грациозная деградация).
-    denis_peer = env("DENIS_TG_PEER", required=False)
+    denis_peer = env("TELEGRAM_EXCHANGE_USERNAME", required=False)
     if denis_peer:
         try:
             denis_entity = await client.get_entity(denis_peer)
@@ -630,7 +630,7 @@ async def main():
             print(f"[live] denis не подключён (resolve entity не удался: {e}); "
                   f"работаю только maxswap")
     else:
-        print("[live] DENIS_TG_PEER не задан — источник denis не поднимается; "
+        print("[live] TELEGRAM_EXCHANGE_USERNAME не задан — источник denis не поднимается; "
               "работаю только maxswap")
 
     # TTL при старте, ДО catch-up: снести протухший pending обмена (§5.3 место 1)
