@@ -92,6 +92,8 @@
     // ── Хелперы ─────────────────────────────────────────────────────────
     const fmt = (n) => Number(n).toLocaleString('ru-RU');
     const disp = (amount, cur) => fmt(amount) + ' ' + cur;
+    // Наличка — целые баты: копейки с авто-обмена в отображение не выносим.
+    const balAmt = (a) => (a.id === 'cash' ? Math.round(a.amount || 0) : (a.amount || 0));
     const curOf = (id) => { const a = state.accounts.find((x) => x.id === id); return a ? curSymbol(a.currency) : ''; };
     const ea = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const el = (id) => document.getElementById(id);
@@ -283,7 +285,7 @@
             </div>`;
           const rowStyle = isMain ? 'padding:0 0 1.6rem;border-bottom:1px solid #1f1f1f;' : 'padding:1.4rem 0;border-bottom:1px solid #141414;';
           const amtStyle = `font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-0.03em;line-height:1;font-size:${isMain ? '3.2rem' : '1.75rem'};color:${isMain ? ACC : '#f0f0f0'};`;
-          return `<div style="${rowStyle}">${nameRow}<div class="bal-amt" data-amount="${a.amount}" data-cur="${ea(cur)}" style="${amtStyle}">${disp(a.amount || 0, cur)}</div></div>`;
+          return `<div style="${rowStyle}">${nameRow}<div class="bal-amt" data-amount="${balAmt(a)}" data-cur="${ea(cur)}" style="${amtStyle}">${disp(balAmt(a), cur)}</div></div>`;
         }).join('');
       }
       const updated = state.balUpdatedAt ? fmtTime(state.balUpdatedAt) : '—';
@@ -379,7 +381,7 @@
           const on = selId === a.id;
           return `<button data-role="${role}" data-id="${a.id}" style="display:flex;flex-direction:column;gap:4px;align-items:flex-start;text-align:left;background:${on ? 'rgba(10,186,181,0.1)' : '#111'};border:1px solid ${on ? ACC : '#1c1c1c'};border-radius:12px;padding:0.65rem 0.9rem;cursor:pointer;transition:transform .25s ${SPRING},background .2s,border-color .2s;color:#f0f0f0;">
             <span style="font-size:1rem;font-weight:${on ? 600 : 500};color:${on ? ACC : '#f0f0f0'};">${ea(a.name)}</span>
-            <span style="font-size:0.75rem;opacity:0.45;font-variant-numeric:tabular-nums;">${disp(a.amount, curSymbol(a.currency))}</span>
+            <span style="font-size:0.75rem;opacity:0.45;font-variant-numeric:tabular-nums;">${disp(balAmt(a), curSymbol(a.currency))}</span>
           </button>`;
         }).join('');
         return `<div style="display:flex;flex-wrap:wrap;gap:0.55rem;">${cards}</div>`;
